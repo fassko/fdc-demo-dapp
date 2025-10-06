@@ -6,8 +6,12 @@ import { ethers } from 'ethers';
 import { coston2 } from '@flarenetwork/flare-periphery-contract-artifacts';
 
 // Helper function to extract contract address from result
-function extractContractAddress(result: any): `0x${string}` {
-  return result.address || result;
+function extractContractAddress(
+  result: { address?: string } | string
+): `0x${string}` {
+  return (
+    typeof result === 'string' ? result : result.address
+  ) as `0x${string}`;
 }
 
 export interface FdcContractAddresses {

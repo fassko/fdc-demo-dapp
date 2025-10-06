@@ -1,6 +1,10 @@
 'use client';
 
 import { zodResolver } from '@hookform/resolvers/zod';
+import { useCallback, useEffect, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { z } from 'zod';
+
 import {
   Check,
   CheckCircle,
@@ -11,9 +15,16 @@ import {
   Loader2,
   XCircle,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
-import { useForm } from 'react-hook-form';
-import { z } from 'zod';
+
+import { createPublicClient, http } from 'viem';
+import {
+  useAccount,
+  useConnect,
+  useDisconnect,
+  usePublicClient,
+  useWaitForTransactionReceipt,
+} from 'wagmi';
+import { flareTestnet } from 'wagmi/chains';
 
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -32,13 +43,6 @@ import {
   retrievePaymentDataAndProofWithRetry,
   verifyPayment,
 } from '@/lib/fdcUtils';
-import { createPublicClient, http } from 'viem';
-import {
-  useAccount,
-  usePublicClient,
-  useWaitForTransactionReceipt,
-} from 'wagmi';
-import { flareTestnet } from 'wagmi/chains';
 
 // Form data types
 const FdcFormDataSchema = z.object({
@@ -58,14 +62,14 @@ interface FdcStep {
   title: string;
   description: string | React.ReactNode;
   status: 'pending' | 'in_progress' | 'completed' | 'error';
-  data?: any;
+  data?: Record<string, unknown>;
   error?: string;
   details?: {
     whatHappens: string;
     technicalDetails: string;
     apiEndpoint?: string | React.ReactNode;
-    requestBody?: any;
-    responseBody?: any;
+    requestBody?: Record<string, unknown>;
+    responseBody?: Record<string, unknown>;
     curlCommand?: string;
   };
 }
@@ -84,16 +88,32 @@ export default function Fdc() {
   const [success, setSuccess] = useState<string | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set());
-  const [currentAttestationData, setCurrentAttestationData] =
-    useState<any>(null);
+  const [currentAttestationData, setCurrentAttestationData] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const [currentAttestationStep, setCurrentAttestationStep] =
     useState<string>('');
-  const [proofData, setProofData] = useState<any>(null);
-  const [verificationResult, setVerificationResult] = useState<any>(null);
+  const [proofData, setProofData] = useState<Record<string, unknown> | null>(
+    null
+  );
+  const [verificationResult, setVerificationResult] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
 
   // Wallet and FDC contracts
-  const { isConnected } = useAccount();
+  const { isConnected, address } = useAccount();
+  const { connect, connectors, isPending } = useConnect();
+  const { disconnect } = useDisconnect();
   const wagmiPublicClient = usePublicClient();
+
+  // Handle hydration mismatch
+  const [isHydrated, setIsHydrated] = useState(false);
+
+  useEffect(() => {
+    setIsHydrated(true);
+  }, []);
 
   // Create a fallback public client using wagmi
   const fallbackPublicClient = createPublicClient({
@@ -109,6 +129,7 @@ export default function Fdc() {
   // Write contract with requestAttestation function
   const {
     writeContract: requestAttestation,
+    writeContractAsync: requestAttestationAsync,
     data: attestationHash,
     error: writeError,
   } = useWriteIFdcHubRequestAttestation();
@@ -116,6 +137,170 @@ export default function Fdc() {
   // Wait for transaction receipt
   const { data: receipt, isSuccess: isAttestationSuccess } =
     useWaitForTransactionReceipt({ hash: attestationHash });
+
+  const updateStepStatus = useCallback(
+    (
+      stepId: string,
+      status: FdcStep['status'],
+      data?: Record<string, unknown>,
+      error?: string
+    ) => {
+      setSteps(prev =>
+        prev.map(step =>
+          step.id === stepId ? { ...step, status, data, error } : step
+        )
+      );
+    },
+    []
+  );
+
+  const continueWorkflowAfterSubmission = useCallback(
+    async (transactionReceipt: any) => {
+      try {
+        // Step 3: Wait for Finalization (calculate round ID)
+        updateStepStatus('wait-finalization', 'in_progress');
+        setCurrentAttestationStep('Calculating round ID from transaction...');
+
+        if (!fdcAddresses || !transactionReceipt || !currentAttestationData) {
+          throw new Error('Missing required data for round ID calculation');
+        }
+
+        // Calculate the round ID from the transaction
+        const roundId = await calculateRoundId(
+          { receipt: { blockNumber: transactionReceipt.blockNumber } },
+          fdcAddresses
+        );
+
+        console.log('Calculated round ID:', roundId);
+
+        // Update step to show we're waiting for finalization
+        updateStepStatus('wait-finalization', 'in_progress', {
+          message: `Waiting for voting round ${roundId} to be finalized...`,
+          roundId: roundId,
+        });
+
+        // Wait for the voting round to be finalized
+        setCurrentAttestationStep(
+          `Waiting for voting round ${roundId} to be finalized...`
+        );
+
+        // Wait for finalization (simplified - in implementation this would poll the Systems Manager)
+        await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds for finalization
+
+        console.log('Voting round finalized!');
+        setCurrentAttestationStep('');
+
+        updateStepStatus('wait-finalization', 'completed', {
+          message: 'Voting round finalized',
+          roundId: roundId,
+        });
+
+        // Step 4: Prepare Proof Request (retrieve from DAL)
+        updateStepStatus('prepare-proof', 'in_progress');
+        setCurrentAttestationStep(
+          'Retrieving proof from Data Availability Layer...'
+        );
+
+        const proof = await retrievePaymentDataAndProofWithRetry(
+          FDC_CONSTANTS.DA_LAYER_API_URL,
+          currentAttestationData.abiEncodedRequest as string,
+          roundId,
+          FDC_CONSTANTS.DA_LAYER_API_KEY
+        );
+
+        setProofData(proof);
+
+        console.log('=== Proof data retrieved ===');
+        console.log('Proof data:', proof);
+        console.log('Proof response:', proof.response);
+        console.log('Proof responseBody:', proof.response?.responseBody);
+
+        updateStepStatus('prepare-proof', 'completed', {
+          message: 'Proof retrieved from Data Availability Layer',
+          proof: proof.proof,
+        });
+
+        // Step 5: Verify Data (verify with FDC contract)
+        updateStepStatus('verify-data', 'in_progress');
+        setCurrentAttestationStep(
+          'Verifying payment attestation with FDC Verification contract...'
+        );
+
+        if (!fdcAddresses) {
+          throw new Error('FDC contract addresses not loaded');
+        }
+
+        // Validate proof data before verification
+        if (!proof || !proof.response || !proof.proof) {
+          throw new Error('Proof data is incomplete');
+        }
+
+        console.log('=== Validating proof data before verification ===');
+        console.log('Proof response fields:', Object.keys(proof.response));
+        console.log(
+          'Proof responseBody fields:',
+          Object.keys(proof.response.responseBody || {})
+        );
+
+        // Check for undefined values that would cause BigInt conversion errors
+        const responseBody = proof.response.responseBody;
+        const requiredFields: (keyof typeof responseBody)[] = [
+          'blockNumber',
+          'blockTimestamp',
+          'spentAmount',
+          'intendedSpentAmount',
+          'receivedAmount',
+          'intendedReceivedAmount',
+        ];
+
+        for (const field of requiredFields) {
+          if (
+            responseBody[field] === undefined ||
+            responseBody[field] === null
+          ) {
+            console.error(
+              `Missing or undefined field: ${field}`,
+              responseBody[field]
+            );
+            throw new Error(`Proof data is missing required field: ${field}`);
+          }
+        }
+
+        const verificationResult = await verifyPayment(proof, fdcAddresses);
+
+        console.log('=== Payment verification result ===');
+        console.log('Verification result:', verificationResult);
+        console.log('Verification result type:', typeof verificationResult);
+
+        setVerificationResult({ verified: verificationResult });
+
+        updateStepStatus('verify-data', 'completed', {
+          message: 'Payment attestation verified successfully',
+          verificationResult: verificationResult,
+          verified: verificationResult,
+        });
+
+        setCurrentAttestationStep('');
+        setSuccess(
+          'FDC workflow completed successfully! All steps have been executed.'
+        );
+      } catch (error) {
+        console.error('Error in workflow continuation:', error);
+        setCurrentAttestationStep('');
+        setError(
+          error instanceof Error ? error.message : 'Unknown error occurred'
+        );
+      }
+    },
+    [
+      fdcAddresses,
+      currentAttestationData,
+      updateStepStatus,
+      setCurrentAttestationStep,
+      setProofData,
+      setVerificationResult,
+    ]
+  );
 
   // Handle transaction success
   useEffect(() => {
@@ -134,13 +319,24 @@ export default function Fdc() {
       // Continue with the rest of the workflow
       continueWorkflowAfterSubmission(receipt);
     }
-  }, [isAttestationSuccess, receipt, currentAttestationData, attestationHash]);
+  }, [
+    isAttestationSuccess,
+    receipt,
+    currentAttestationData,
+    attestationHash,
+    continueWorkflowAfterSubmission,
+  ]);
 
   // Handle write contract errors
   useEffect(() => {
     if (writeError) {
       console.error('Write contract error:', writeError);
-      updateStepStatus('submit-request', 'error', null, writeError.message);
+      updateStepStatus(
+        'submit-request',
+        'error',
+        undefined,
+        writeError.message
+      );
       setError(`Transaction failed: ${writeError.message}`);
     }
   }, [writeError]);
@@ -289,19 +485,6 @@ export default function Fdc() {
     },
   ]);
 
-  const updateStepStatus = (
-    stepId: string,
-    status: FdcStep['status'],
-    data?: any,
-    error?: string
-  ) => {
-    setSteps(prev =>
-      prev.map(step =>
-        step.id === stepId ? { ...step, status, data, error } : step
-      )
-    );
-  };
-
   const prepareRequest = async (transactionId: string) => {
     try {
       updateStepStatus('prepare-request', 'in_progress');
@@ -378,7 +561,7 @@ export default function Fdc() {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error occurred';
-      updateStepStatus('prepare-request', 'error', null, errorMessage);
+      updateStepStatus('prepare-request', 'error', undefined, errorMessage);
       throw error;
     }
   };
@@ -433,7 +616,7 @@ export default function Fdc() {
       await submitAttestationRequestWithWagmi(
         attestationResponse.abiEncodedRequest,
         fdcAddresses,
-        requestAttestation
+        requestAttestationAsync
       );
 
       // The rest of the workflow will continue automatically when the transaction is confirmed
@@ -496,7 +679,7 @@ export default function Fdc() {
   const submitAttestationRequestWithWagmi = async (
     abiEncodedRequest: string,
     fdcAddresses: { fdcHub: string; fdcRequestFeeConfigurations: string },
-    requestAttestation: any
+    requestAttestationAsync: any
   ): Promise<void> => {
     if (!abiEncodedRequest) {
       throw new Error('ABI encoded request is undefined or empty');
@@ -537,146 +720,11 @@ export default function Fdc() {
     }
 
     // Submit the attestation request
-    requestAttestation({
+    await requestAttestationAsync({
       address: fdcAddresses.fdcHub as `0x${string}`,
       args: [abiEncodedRequest as `0x${string}`],
       value: requestFee,
     });
-  };
-
-  const continueWorkflowAfterSubmission = async (transactionReceipt: any) => {
-    try {
-      // Step 3: Wait for Finalization (calculate round ID)
-      updateStepStatus('wait-finalization', 'in_progress');
-      setCurrentAttestationStep('Calculating round ID from transaction...');
-
-      if (!fdcAddresses || !transactionReceipt || !currentAttestationData) {
-        throw new Error('Missing required data for round ID calculation');
-      }
-
-      // Calculate the round ID from the transaction
-      const roundId = await calculateRoundId(
-        { receipt: { blockNumber: transactionReceipt.blockNumber } },
-        fdcAddresses
-      );
-
-      console.log('Calculated round ID:', roundId);
-
-      // Update step to show we're waiting for finalization
-      updateStepStatus('wait-finalization', 'in_progress', {
-        message: `Waiting for voting round ${roundId} to be finalized...`,
-        roundId: roundId,
-      });
-
-      // Wait for the voting round to be finalized
-      setCurrentAttestationStep(
-        `Waiting for voting round ${roundId} to be finalized...`
-      );
-
-      // Wait for finalization (simplified - in implementation this would poll the Systems Manager)
-      await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds for finalization
-
-      console.log('Voting round finalized!');
-      setCurrentAttestationStep('');
-
-      updateStepStatus('wait-finalization', 'completed', {
-        message: 'Voting round finalized',
-        roundId: roundId,
-      });
-
-      // Step 4: Prepare Proof Request (retrieve from DAL)
-      updateStepStatus('prepare-proof', 'in_progress');
-      setCurrentAttestationStep(
-        'Retrieving proof from Data Availability Layer...'
-      );
-
-      const proof = await retrievePaymentDataAndProofWithRetry(
-        FDC_CONSTANTS.DA_LAYER_API_URL,
-        currentAttestationData.abiEncodedRequest,
-        roundId,
-        FDC_CONSTANTS.DA_LAYER_API_KEY
-      );
-
-      setProofData(proof);
-
-      console.log('=== Proof data retrieved ===');
-      console.log('Proof data:', proof);
-      console.log('Proof response:', proof.response);
-      console.log('Proof responseBody:', proof.response?.responseBody);
-
-      updateStepStatus('prepare-proof', 'completed', {
-        message: 'Proof retrieved from Data Availability Layer',
-        proof: proof.proof,
-      });
-
-      // Step 5: Verify Data (verify with FDC contract)
-      updateStepStatus('verify-data', 'in_progress');
-      setCurrentAttestationStep(
-        'Verifying payment attestation with FDC Verification contract...'
-      );
-
-      if (!fdcAddresses) {
-        throw new Error('FDC contract addresses not loaded');
-      }
-
-      // Validate proof data before verification
-      if (!proof || !proof.response || !proof.proof) {
-        throw new Error('Proof data is incomplete');
-      }
-
-      console.log('=== Validating proof data before verification ===');
-      console.log('Proof response fields:', Object.keys(proof.response));
-      console.log(
-        'Proof responseBody fields:',
-        Object.keys(proof.response.responseBody || {})
-      );
-
-      // Check for undefined values that would cause BigInt conversion errors
-      const responseBody = proof.response.responseBody;
-      const requiredFields: (keyof typeof responseBody)[] = [
-        'blockNumber',
-        'blockTimestamp',
-        'spentAmount',
-        'intendedSpentAmount',
-        'receivedAmount',
-        'intendedReceivedAmount',
-      ];
-
-      for (const field of requiredFields) {
-        if (responseBody[field] === undefined || responseBody[field] === null) {
-          console.error(
-            `Missing or undefined field: ${field}`,
-            responseBody[field]
-          );
-          throw new Error(`Proof data is missing required field: ${field}`);
-        }
-      }
-
-      const verificationResult = await verifyPayment(proof, fdcAddresses);
-
-      console.log('=== Payment verification result ===');
-      console.log('Verification result:', verificationResult);
-      console.log('Verification result type:', typeof verificationResult);
-
-      setVerificationResult(verificationResult);
-
-      updateStepStatus('verify-data', 'completed', {
-        message: 'Payment attestation verified successfully',
-        verificationResult: verificationResult,
-        verified: verificationResult,
-      });
-
-      setCurrentAttestationStep('');
-      setSuccess(
-        'FDC workflow completed successfully! All steps have been executed.'
-      );
-    } catch (error) {
-      console.error('Error in workflow continuation:', error);
-      setCurrentAttestationStep('');
-      setError(
-        error instanceof Error ? error.message : 'Unknown error occurred'
-      );
-    }
   };
 
   return (
@@ -734,16 +782,92 @@ export default function Fdc() {
               <li>
                 • Enter a valid XRPL transaction ID (64-character hex string)
               </li>
-              <li>• Click "Execute FDC Workflow" to start the tutorial</li>
               <li>
-                • Click "Show Details" on any step to see technical explanations
-                and cURL commands
+                • Click &quot;Execute FDC Workflow&quot; to start the tutorial
+              </li>
+              <li>
+                • Click &quot;Show Details&quot; on any step to see technical
+                explanations and cURL commands
               </li>
               <li>
                 • Use the copy buttons to copy important data like ABI encoded
                 requests and proofs
               </li>
             </ul>
+          </div>
+
+          {/* Wallet Connection Section */}
+          <div
+            className='space-y-4 p-4 border rounded-lg mb-6'
+            style={{ backgroundColor: '#fef7f0', borderColor: '#E62058' }}
+          >
+            <h3 className='text-lg font-semibold' style={{ color: '#E62058' }}>
+              🔗 Wallet Connection
+            </h3>
+
+            {!isHydrated ? (
+              <div className='space-y-3'>
+                <p className='text-sm' style={{ color: '#E62058' }}>
+                  Loading wallet connection...
+                </p>
+              </div>
+            ) : !isConnected ? (
+              <div className='space-y-3'>
+                <p className='text-sm' style={{ color: '#E62058' }}>
+                  Connect your MetaMask wallet to interact with the Flare Data
+                  Connector.
+                </p>
+                <div className='flex flex-wrap gap-2'>
+                  {connectors.map(connector => (
+                    <Button
+                      key={connector.uid}
+                      onClick={() => connect({ connector })}
+                      disabled={isPending}
+                      className='flex items-center gap-2'
+                      style={{ backgroundColor: '#E62058', color: 'white' }}
+                    >
+                      {isPending ? (
+                        <Loader2 className='h-4 w-4 animate-spin' />
+                      ) : (
+                        <span>🔗</span>
+                      )}
+                      Connect {connector.name}
+                    </Button>
+                  ))}
+                </div>
+                <p className='text-xs text-gray-600'>
+                  Make sure you&apos;re connected to Flare Coston2 testnet in
+                  MetaMask
+                </p>
+              </div>
+            ) : (
+              <div className='space-y-3'>
+                <div className='flex items-center gap-2'>
+                  <span
+                    className='text-sm font-medium'
+                    style={{ color: '#E62058' }}
+                  >
+                    ✅ Connected
+                  </span>
+                </div>
+                <div className='text-sm text-gray-700'>
+                  <p>
+                    <strong>Address:</strong> {address}
+                  </p>
+                  <p>
+                    <strong>Network:</strong> Flare Coston2 Testnet
+                  </p>
+                </div>
+                <Button
+                  onClick={() => disconnect()}
+                  variant='outline'
+                  size='sm'
+                  style={{ borderColor: '#E62058', color: '#E62058' }}
+                >
+                  Disconnect
+                </Button>
+              </div>
+            )}
           </div>
 
           <form
@@ -818,6 +942,7 @@ export default function Fdc() {
               type='submit'
               disabled={
                 isLoading ||
+                !isHydrated ||
                 !isConnected ||
                 isLoadingAddresses ||
                 !!addressError
@@ -829,6 +954,16 @@ export default function Fdc() {
                 <>
                   <Loader2 className='mr-2 h-4 w-4 animate-spin' />
                   Executing FDC Workflow...
+                </>
+              ) : !isHydrated ? (
+                <>
+                  <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                  Loading...
+                </>
+              ) : !isConnected ? (
+                <>
+                  <XCircle className='mr-2 h-4 w-4' />
+                  Connect Wallet to Execute
                 </>
               ) : (
                 <>
@@ -876,7 +1011,7 @@ export default function Fdc() {
         <h2 className='text-xl font-semibold' style={{ color: '#E62058' }}>
           FDC Workflow Steps
         </h2>
-        {steps.map((step, index) => (
+        {steps.map(step => (
           <Card key={step.id} className={`${getStepStatusColor(step.status)}`}>
             <CardContent className='p-4'>
               <div className='flex items-start gap-3'>
@@ -988,21 +1123,21 @@ export default function Fdc() {
                     <div className='mt-4 space-y-2 border-t pt-4'>
                       <h4 className='font-medium text-gray-900'>Results:</h4>
 
-                      {step.data.abiEncodedRequest && (
+                      {step.data?.abiEncodedRequest && (
                         <div className='flex items-center gap-2'>
                           <span className='text-sm font-medium'>
                             ABI Encoded Request:
                           </span>
                           <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono flex-1'>
-                            {step.data.abiEncodedRequest.length > 20
-                              ? `${step.data.abiEncodedRequest.slice(0, 10)}...${step.data.abiEncodedRequest.slice(-10)}`
-                              : step.data.abiEncodedRequest}
+                            {String(step.data.abiEncodedRequest).length > 20
+                              ? `${String(step.data.abiEncodedRequest).slice(0, 10)}...${String(step.data.abiEncodedRequest).slice(-10)}`
+                              : String(step.data.abiEncodedRequest)}
                           </code>
                           <button
                             type='button'
                             onClick={() =>
                               copyToClipboardWithTimeout(
-                                step.data.abiEncodedRequest,
+                                String(step.data.abiEncodedRequest),
                                 setCopiedText
                               )
                             }
@@ -1022,10 +1157,10 @@ export default function Fdc() {
                           <span className='text-sm font-medium'>Round ID:</span>
                           <div className='flex items-center gap-2'>
                             <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono'>
-                              {step.data.roundId}
+                              {String(step.data.roundId)}
                             </code>
                             <a
-                              href={`https://coston2-systems-explorer.flare.rocks/voting-round/${step.data.roundId}?tab=fdc`}
+                              href={`https://coston2-systems-explorer.flare.rocks/voting-round/${String(step.data.roundId)}?tab=fdc`}
                               target='_blank'
                               rel='noopener noreferrer'
                               className='hover:opacity-80 text-xs underline inline-flex items-center gap-1'
@@ -1059,44 +1194,45 @@ export default function Fdc() {
                             Proof Array:
                           </span>
                           <div className='space-y-1'>
-                            {step.data.proof.map(
-                              (proofItem: string, proofIndex: number) => (
-                                <div
-                                  key={proofIndex}
-                                  className='flex items-center gap-2'
-                                >
-                                  <span className='text-xs text-gray-600 w-6'>
-                                    [{proofIndex}]:
-                                  </span>
-                                  <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono flex-1'>
-                                    {proofItem}
-                                  </code>
-                                  <button
-                                    type='button'
-                                    onClick={() =>
-                                      copyToClipboardWithTimeout(
-                                        proofItem,
-                                        setCopiedText
-                                      )
-                                    }
-                                    className='h-6 w-6 p-0 hover:bg-gray-200 rounded'
+                            {Array.isArray(step.data.proof) &&
+                              step.data.proof.map(
+                                (proofItem: string, proofIndex: number) => (
+                                  <div
+                                    key={proofIndex}
+                                    className='flex items-center gap-2'
                                   >
-                                    {copiedText === proofItem ? (
-                                      <Check className='h-3 w-3 text-green-600' />
-                                    ) : (
-                                      <Copy className='h-3 w-3 text-gray-500' />
-                                    )}
-                                  </button>
-                                </div>
-                              )
-                            )}
+                                    <span className='text-xs text-gray-600 w-6'>
+                                      [{proofIndex}]:
+                                    </span>
+                                    <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono flex-1'>
+                                      {proofItem}
+                                    </code>
+                                    <button
+                                      type='button'
+                                      onClick={() =>
+                                        copyToClipboardWithTimeout(
+                                          proofItem,
+                                          setCopiedText
+                                        )
+                                      }
+                                      className='h-6 w-6 p-0 hover:bg-gray-200 rounded'
+                                    >
+                                      {copiedText === proofItem ? (
+                                        <Check className='h-3 w-3 text-green-600' />
+                                      ) : (
+                                        <Copy className='h-3 w-3 text-gray-500' />
+                                      )}
+                                    </button>
+                                  </div>
+                                )
+                              )}
                           </div>
                         </div>
                       )}
 
                       {step.data.message && (
                         <p className='text-sm text-gray-700 bg-white/50 rounded p-2'>
-                          {step.data.message}
+                          {String(step.data.message)}
                         </p>
                       )}
 
@@ -1161,12 +1297,12 @@ export default function Fdc() {
                           </span>
                           <div className='flex items-center gap-2 flex-1'>
                             <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono flex-1'>
-                              {step.data.transactionHash.length > 20
-                                ? `${step.data.transactionHash.slice(0, 10)}...${step.data.transactionHash.slice(-10)}`
-                                : step.data.transactionHash}
+                              {String(step.data.transactionHash).length > 20
+                                ? `${String(step.data.transactionHash).slice(0, 10)}...${String(step.data.transactionHash).slice(-10)}`
+                                : String(step.data.transactionHash)}
                             </code>
                             <a
-                              href={`https://coston2-explorer.flare.network/tx/${step.data.transactionHash}`}
+                              href={`https://coston2-explorer.flare.network/tx/${String(step.data.transactionHash)}`}
                               target='_blank'
                               rel='noopener noreferrer'
                               className='hover:opacity-80 text-xs underline inline-flex items-center gap-1'
@@ -1178,7 +1314,7 @@ export default function Fdc() {
                               type='button'
                               onClick={() =>
                                 copyToClipboardWithTimeout(
-                                  step.data.transactionHash,
+                                  String(step.data.transactionHash),
                                   setCopiedText
                                 )
                               }
@@ -1201,10 +1337,10 @@ export default function Fdc() {
                           </span>
                           <div className='flex items-center gap-2'>
                             <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono'>
-                              {step.data.blockNumber}
+                              {String(step.data.blockNumber)}
                             </code>
                             <a
-                              href={`https://coston2-explorer.flare.network/block/${step.data.blockNumber}`}
+                              href={`https://coston2-explorer.flare.network/block/${String(step.data.blockNumber)}`}
                               target='_blank'
                               rel='noopener noreferrer'
                               className='hover:opacity-80 text-xs underline inline-flex items-center gap-1'
@@ -1243,7 +1379,8 @@ export default function Fdc() {
                             <div className='bg-gray-100 p-3 rounded text-xs font-mono overflow-x-auto'>
                               <pre className='whitespace-pre-wrap'>
                                 {JSON.stringify(
-                                  step.data.requestDetails.requestBody,
+                                  (step.data.requestDetails as any)
+                                    ?.requestBody,
                                   null,
                                   2
                                 )}
@@ -1257,7 +1394,8 @@ export default function Fdc() {
                             <div className='bg-gray-100 p-3 rounded text-xs font-mono overflow-x-auto'>
                               <pre className='whitespace-pre-wrap'>
                                 {JSON.stringify(
-                                  step.data.requestDetails.responseBody,
+                                  (step.data.requestDetails as any)
+                                    ?.responseBody,
                                   null,
                                   2
                                 )}
@@ -1295,7 +1433,7 @@ export default function Fdc() {
               scenes.
             </p>
             <div>
-              <h4 className='font-medium mb-1'>What you'll learn:</h4>
+              <h4 className='font-medium mb-1'>What you&apos;ll learn:</h4>
               <ul className='list-disc list-inside space-y-1 ml-2'>
                 <li>
                   How to prepare attestation requests using the verifier API

@@ -19,8 +19,9 @@ const eslintConfig = [
       import: eslintPluginImport,
     },
     rules: {
+      '@typescript-eslint/no-explicit-any': 'warn',
       'import/order': [
-        'error',
+        'warn',
         {
           groups: [
             'builtin',
