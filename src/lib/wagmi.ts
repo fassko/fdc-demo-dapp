@@ -1,6 +1,6 @@
 import { createConfig, http } from 'wagmi';
 import { flareTestnet } from 'wagmi/chains';
-import { injected } from 'wagmi/connectors';
+import { injected } from 'wagmi/connectors/injected';
 
 export const config = createConfig({
   chains: [flareTestnet],
