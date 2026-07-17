@@ -1,10 +1,10 @@
 # Flare Data Connector (FDC) Demo
 
-A comprehensive interactive tutorial demonstrating the complete Flare Data Connector (FDC) workflow for XRP Payment Attestation. This demo showcases how to request, verify, and use cross-chain data from external networks on Flare.
+A comprehensive interactive tutorial demonstrating the complete Flare Data Connector (FDC) workflow for XRPPayment attestation. This demo showcases how to request, verify, and use cross-chain data from external networks on Flare.
 
 ## 🚀 What is FDC?
 
-The [Flare Data Connector (FDC)](https://dev.flare.network/fdc/overview) is a decentralized oracle system that allows smart contracts on Flare to securely access data from external networks like XRP Ledger. This demo walks you through the complete process of requesting and verifying XRP payment attestations.
+The [Flare Data Connector (FDC)](https://dev.flare.network/fdc/overview) is a decentralized oracle system that allows smart contracts on Flare to securely access data from external networks like XRP Ledger. This demo walks you through the complete process of requesting and verifying XRPPayment attestations.
 
 ## ✨ Features
 
@@ -23,7 +23,7 @@ The [Flare Data Connector (FDC)](https://dev.flare.network/fdc/overview) is a de
 2. **Submit Request** - Execute `FdcHub.requestAttestation` transaction
 3. **Wait for Finalization** - Monitor voting round completion
 4. **Retrieve Proof** - Get attestation data from Data Availability Layer
-5. **Verify Payment** - Validate the attestation on-chain
+5. **Verify XRPPayment** - Validate the attestation on-chain
 
 ## 🛠️ Getting Started
 
@@ -130,7 +130,7 @@ The demo includes comprehensive educational content explaining:
 - [FDC Implementation Guide](https://dev.flare.network/fdc/guides/fdc-by-hand)
 - [FdcHub Contract Reference](https://dev.flare.network/fdc/reference/IFdcHub)
 - [FdcVerification Contract Reference](https://dev.flare.network/fdc/reference/IFdcVerification)
-- [XRP Payment Attestation](https://dev.flare.network/fdc/attestation-types/payment)
+- [XRPPayment Attestation](https://dev.flare.network/fdc/attestation-types/xrp-payment)
 
 ## 🐛 Troubleshooting
 

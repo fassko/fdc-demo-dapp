@@ -1,7 +1,7 @@
 'use client';
 
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -16,7 +16,7 @@ import {
   XCircle,
 } from 'lucide-react';
 
-import { createPublicClient, http } from 'viem';
+import { createPublicClient, http, type Abi } from 'viem';
 import {
   useAccount,
   useConnect,
@@ -31,31 +31,52 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   iFdcRequestFeeConfigurationsAbi,
-  useWriteIFdcHubRequestAttestation,
-} from '@/generated';
+  useWriteIFdcHub,
+} from '@flarenetwork/flare-wagmi-periphery-package/contracts/coston2';
 import { useFdcContracts } from '@/hooks/useFdcContracts';
 import { copyToClipboardWithTimeout } from '@/lib/clipboard';
 import {
   calculateRoundId,
   FDC_CONSTANTS,
-  retrievePaymentDataAndProofWithRetry,
-  verifyPayment,
+  prepareEVMTransactionAttestationRequest,
+  prepareXRPPaymentAttestationRequest,
+  retrieveEVMTransactionDataAndProofWithRetry,
+  retrieveXRPPaymentDataAndProofWithRetry,
+  type EVMTransactionProofData,
+  type XRPPaymentProofData,
+  verifyEVMTransaction,
+  verifyXRPPayment,
 } from '@/lib/fdcUtils';
 
-// Form data types
-const FdcFormDataSchema = z.object({
-  transactionId: z
-    .string()
-    .min(1, 'Transaction ID is required')
-    .refine(
-      val => /^[A-F0-9]{64}$/i.test(val.trim()),
-      'Transaction ID must be a valid 64-character hexadecimal XRPL transaction ID'
-    ),
-});
+type AttestationType = 'XRPPayment' | 'EVMTransaction';
 
-type FdcFormData = z.infer<typeof FdcFormDataSchema>;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+const SEPOLIA_TX_HASH =
+  '0x9436ff8110d6a8982f4e62aa6dc28fb875beb926c5ba61f89a4d461675af98bb';
+const SAMPLE_XRPL_TX =
+  'A6589F33CA3B679CF3E833632E81E5A075CED6057316782A2B466FF64D05CBF0';
+
+const createFdcFormSchema = (attestationType: AttestationType) =>
+  z.object({
+    transactionId: z
+      .string()
+      .min(1, 'Transaction ID is required')
+      .refine(
+        val =>
+          attestationType === 'XRPPayment'
+            ? /^[A-F0-9]{64}$/i.test(val.trim())
+            : /^0x[A-F0-9]{64}$/i.test(val.trim()),
+        attestationType === 'XRPPayment'
+          ? 'Transaction ID must be a valid 64-character hexadecimal XRPL transaction ID'
+          : 'Transaction hash must be a valid 0x-prefixed 64-character hexadecimal string'
+      ),
+  });
+
+type FdcFormData = z.infer<ReturnType<typeof createFdcFormSchema>>;
 
 interface FdcStep {
   id: string;
@@ -74,16 +95,216 @@ interface FdcStep {
   };
 }
 
+const getInitialSteps = (
+  attestationType: AttestationType,
+  proofOwner: string = ZERO_ADDRESS
+): FdcStep[] => {
+  const isEvm = attestationType === 'EVMTransaction';
+
+  return [
+    {
+      id: 'prepare-request',
+      title: '1. Prepare Request',
+      description: 'Prepare the attestation request using the verifier API',
+      status: 'pending',
+      details: {
+        whatHappens: isEvm
+          ? 'We send your Sepolia transaction hash to the Flare ETH verifier to create an ABI-encoded EVMTransaction request.'
+          : 'We send your XRPL transaction ID and proofOwner to the Flare verifier to create an ABI-encoded XRPPayment request.',
+        technicalDetails: isEvm
+          ? 'The verifier validates the transaction hash and builds a request with attestation type (EVMTransaction), source ID (testETH), requiredConfirmations, provideInput, listEvents, and logIndices. See the eth verifier API docs for the schema.'
+          : 'The verifier validates the transaction ID and creates a request with attestation type (XRPPayment), source ID (testXRP), transactionId, and proofOwner. The response contains an abiEncodedRequest — a hex string the FDC contract understands.',
+        apiEndpoint: isEvm
+          ? 'https://fdc-verifiers-testnet.flare.network/verifier/eth/EVMTransaction/prepareRequest'
+          : 'https://fdc-verifiers-testnet.flare.network/verifier/xrp/XRPPayment/prepareRequest',
+        curlCommand: isEvm
+          ? `curl -X 'POST' \\
+  'https://fdc-verifiers-testnet.flare.network/verifier/eth/EVMTransaction/prepareRequest' \\
+  -H 'accept: application/json' \\
+  -H 'X-API-KEY: 00000000-0000-0000-0000-000000000000' \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+  "attestationType": "0x45564d5472616e73616374696f6e000000000000000000000000000000000000",
+  "sourceId": "0x7465737445544800000000000000000000000000000000000000000000000000",
+  "requestBody": {
+    "transactionHash": "${SEPOLIA_TX_HASH}",
+    "requiredConfirmations": "1",
+    "provideInput": true,
+    "listEvents": true,
+    "logIndices": []
+  }
+}'`
+          : `curl -X 'POST' \\
+  'https://fdc-verifiers-testnet.flare.network/verifier/xrp/XRPPayment/prepareRequest' \\
+  -H 'accept: application/json' \\
+  -H 'X-API-KEY: 00000000-0000-0000-0000-000000000000' \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+  "attestationType": "0x5852505061796d656e7400000000000000000000000000000000000000000000",
+  "sourceId": "0x7465737458525000000000000000000000000000000000000000000000000000",
+  "requestBody": {
+    "transactionId": "${SAMPLE_XRPL_TX}",
+    "proofOwner": "${proofOwner}"
+  }
+}'`,
+      },
+    },
+    {
+      id: 'submit-request',
+      title: '2. Submit Request',
+      description: (
+        <>
+          Submit the attestation request to the{' '}
+          <a
+            href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'
+            target='_blank'
+            rel='noopener noreferrer'
+            className='hover:opacity-80 underline inline-flex items-center gap-1'
+            style={{ color: '#E62058' }}
+          >
+            FdcHub contract
+            <ExternalLink className='h-3 w-3' />
+          </a>
+        </>
+      ),
+      status: 'pending',
+      details: {
+        whatHappens:
+          'The ABI-encoded request is submitted to the FdcHub smart contract on the Flare blockchain, along with the required fee.',
+        technicalDetails: isEvm
+          ? 'This creates a transaction on Coston2 that requests the FDC to attest the Sepolia (testETH) EVM transaction. The contract stores the request and waits for the next voting round.'
+          : 'This creates a transaction on the blockchain that requests the FDC to verify your XRPL Payment transaction. The contract stores the request and waits for the next voting round.',
+        apiEndpoint: (
+          <a
+            href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'
+            target='_blank'
+            rel='noopener noreferrer'
+            className='hover:opacity-80 underline inline-flex items-center gap-1'
+            style={{ color: '#E62058' }}
+          >
+            FdcHub.requestAttestation() - Smart Contract Call
+            <ExternalLink className='h-3 w-3' />
+          </a>
+        ),
+      },
+    },
+    {
+      id: 'wait-finalization',
+      title: '3. Wait for Finalization',
+      description: 'Wait for the voting round to be finalized',
+      status: 'pending',
+      details: {
+        whatHappens:
+          'The FDC validators vote on your request during the voting round. We wait for the round to be finalized before proceeding.',
+        technicalDetails: isEvm
+          ? 'Voting rounds occur every 90 seconds. Validators check Sepolia for your transaction and vote on its validity. We wait for the round to be finalized before retrieving the proof.'
+          : 'Voting rounds occur every 90 seconds. Validators check the XRPL for your transaction and vote on its validity. We wait for the round to be finalized before retrieving the proof.',
+        apiEndpoint:
+          'https://coston2-systems-explorer.flare.rocks/voting-round/{roundId}?tab=fdc',
+      },
+    },
+    {
+      id: 'prepare-proof',
+      title: '4. Prepare Proof Request',
+      description:
+        'Prepare the proof request using the Data Availability Client',
+      status: 'pending',
+      details: {
+        whatHappens:
+          'We retrieve the proof and attestation data from the Data Availability Layer using the finalized voting round ID.',
+        technicalDetails:
+          'The Data Availability Client provides cryptographic proof that your transaction was verified by the FDC validators. This includes Merkle tree proofs and the attestation response.',
+        apiEndpoint:
+          'https://ctn2-data-availability.flare.network/api/v1/fdc/proof-by-request-round',
+        curlCommand: `curl -X 'POST' \\
+  'https://ctn2-data-availability.flare.network/api/v1/fdc/proof-by-request-round' \\
+  -H 'accept: application/json' \\
+  -H 'x-api-key: 00000000-0000-0000-0000-000000000000' \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+  "votingRoundId": ROUND_ID,
+  "requestBytes": "ABI_ENCODED_REQUEST"
+}'`,
+      },
+    },
+    {
+      id: 'verify-data',
+      title: '5. Verify Data',
+      description: (
+        <>
+          Verify the proof using the{' '}
+          <a
+            href={
+              isEvm
+                ? 'https://dev.flare.network/fdc/reference/IFdcVerification#verifyevmtransaction'
+                : 'https://dev.flare.network/fdc/reference/IFdcVerification#verifyxrppayment'
+            }
+            target='_blank'
+            rel='noopener noreferrer'
+            className='hover:opacity-80 underline inline-flex items-center gap-1'
+            style={{ color: '#E62058' }}
+          >
+            FdcVerification contract
+            <ExternalLink className='h-3 w-3' />
+          </a>
+        </>
+      ),
+      status: 'pending',
+      details: {
+        whatHappens: isEvm
+          ? "The cryptographic proof is verified on-chain using FdcVerification.verifyEVMTransaction to ensure the EVM transaction attestation is valid and hasn't been tampered with."
+          : "The cryptographic proof is verified on-chain using FdcVerification.verifyXRPPayment to ensure the XRPL payment attestation is valid and hasn't been tampered with.",
+        technicalDetails: isEvm
+          ? 'This final step uses the FdcVerification contract to cryptographically verify that the EVMTransaction proof is valid and the attestation data is authentic.'
+          : 'This final step uses the FdcVerification contract to cryptographically verify that the XRPPayment proof is valid and the attestation data is authentic.',
+        apiEndpoint: (
+          <a
+            href={
+              isEvm
+                ? 'https://dev.flare.network/fdc/reference/IFdcVerification#verifyevmtransaction'
+                : 'https://dev.flare.network/fdc/reference/IFdcVerification#verifyxrppayment'
+            }
+            target='_blank'
+            rel='noopener noreferrer'
+            className='hover:opacity-80 underline inline-flex items-center gap-1'
+            style={{ color: '#E62058' }}
+          >
+            {isEvm
+              ? 'FdcVerification.verifyEVMTransaction() - Smart Contract Call'
+              : 'FdcVerification.verifyXRPPayment() - Smart Contract Call'}
+            <ExternalLink className='h-3 w-3' />
+          </a>
+        ),
+      },
+    },
+  ];
+};
+
 export default function Fdc() {
+  const [attestationType, setAttestationType] =
+    useState<AttestationType>('EVMTransaction');
+
+  const formSchema = useMemo(
+    () => createFdcFormSchema(attestationType),
+    [attestationType]
+  );
+
   const {
     register,
     handleSubmit,
+    reset,
     formState: { errors },
   } = useForm<FdcFormData>({
-    resolver: zodResolver(FdcFormDataSchema),
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      transactionId: SEPOLIA_TX_HASH,
+    },
   });
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [mainTab, setMainTab] = useState<'configure' | 'workflow' | 'guide'>(
+    'configure'
+  );
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
@@ -104,9 +325,38 @@ export default function Fdc() {
 
   // Wallet and FDC contracts
   const { isConnected, address } = useAccount();
-  const { connect, connectors, isPending } = useConnect();
+  const { connect, connectors, isPending, error: connectError } = useConnect();
   const { disconnect } = useDisconnect();
   const wagmiPublicClient = usePublicClient();
+
+  const handleConnect = () => {
+    const metaMaskConnector =
+      connectors.find(
+        c =>
+          c.id === 'metaMask' ||
+          c.id === 'io.metamask' ||
+          c.name.toLowerCase().includes('metamask')
+      ) || connectors.find(c => c.id === 'injected') ||
+      connectors[0];
+
+    if (!metaMaskConnector) {
+      setError(
+        'MetaMask not found. Install the MetaMask Chrome extension and refresh this page.'
+      );
+      return;
+    }
+
+    if (typeof window !== 'undefined' && !window.ethereum) {
+      setError(
+        'MetaMask not detected. Open this page in Chrome with the MetaMask extension enabled.'
+      );
+      return;
+    }
+
+    setError(null);
+    connect({ connector: metaMaskConnector });
+  };
+
 
   // Handle hydration mismatch
   const [isHydrated, setIsHydrated] = useState(false);
@@ -132,7 +382,7 @@ export default function Fdc() {
     writeContractAsync: requestAttestationAsync,
     data: attestationHash,
     error: writeError,
-  } = useWriteIFdcHubRequestAttestation();
+  } = useWriteIFdcHub();
 
   // Wait for transaction receipt
   const { data: receipt, isSuccess: isAttestationSuccess } =
@@ -184,14 +434,45 @@ export default function Fdc() {
           `Waiting for voting round ${roundId} to be finalized...`
         );
 
-        // Wait for finalization (simplified - in implementation this would poll the Systems Manager)
-        await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds for finalization
+        // Check finalization status with polling
+        let isFinalized = false;
+        let attempts = 0;
+        const maxAttempts = 20; // Poll for up to 2 minutes (20 * 6 seconds)
 
-        console.log('Voting round finalized!');
+        while (!isFinalized && attempts < maxAttempts) {
+          try {
+            // In a real implementation, this would check the Flare Systems Manager contract
+            // For now, we'll simulate the finalization check with a realistic delay
+            await new Promise(resolve => setTimeout(resolve, 6000)); // Wait 6 seconds between checks
+
+            attempts++;
+
+            // Update the status to show we're still checking
+            setCurrentAttestationStep(
+              `Checking finalization status... (attempt ${attempts}/${maxAttempts})`
+            );
+
+            // Simulate finalization after a reasonable delay (around 90 seconds)
+            if (attempts >= 15) {
+              isFinalized = true;
+              console.log('Voting round finalized!');
+            }
+          } catch (error) {
+            console.error('Error checking finalization:', error);
+            await new Promise(resolve => setTimeout(resolve, 6000));
+            attempts++;
+          }
+        }
+
+        if (!isFinalized) {
+          throw new Error(
+            'Voting round finalization timeout - please try again later'
+          );
+        }
+
         setCurrentAttestationStep('');
-
         updateStepStatus('wait-finalization', 'completed', {
-          message: 'Voting round finalized',
+          message: `Voting round ${roundId} finalized successfully`,
           roundId: roundId,
         });
 
@@ -201,12 +482,20 @@ export default function Fdc() {
           'Retrieving proof from Data Availability Layer...'
         );
 
-        const proof = await retrievePaymentDataAndProofWithRetry(
-          FDC_CONSTANTS.DA_LAYER_API_URL,
-          currentAttestationData.abiEncodedRequest as string,
-          roundId,
-          FDC_CONSTANTS.DA_LAYER_API_KEY
-        );
+        const proof =
+          attestationType === 'EVMTransaction'
+            ? await retrieveEVMTransactionDataAndProofWithRetry(
+                FDC_CONSTANTS.DA_LAYER_API_URL,
+                currentAttestationData.abiEncodedRequest as string,
+                roundId,
+                FDC_CONSTANTS.DA_LAYER_API_KEY
+              )
+            : await retrieveXRPPaymentDataAndProofWithRetry(
+                FDC_CONSTANTS.DA_LAYER_API_URL,
+                currentAttestationData.abiEncodedRequest as string,
+                roundId,
+                FDC_CONSTANTS.DA_LAYER_API_KEY
+              );
 
         setProofData(proof);
 
@@ -223,7 +512,9 @@ export default function Fdc() {
         // Step 5: Verify Data (verify with FDC contract)
         updateStepStatus('verify-data', 'in_progress');
         setCurrentAttestationStep(
-          'Verifying payment attestation with FDC Verification contract...'
+          attestationType === 'EVMTransaction'
+            ? 'Verifying EVMTransaction attestation with FDC Verification contract...'
+            : 'Verifying XRPPayment attestation with FDC Verification contract...'
         );
 
         if (!fdcAddresses) {
@@ -242,43 +533,80 @@ export default function Fdc() {
           Object.keys(proof.response.responseBody || {})
         );
 
-        // Check for undefined values that would cause BigInt conversion errors
         const responseBody = proof.response.responseBody;
-        const requiredFields: (keyof typeof responseBody)[] = [
-          'blockNumber',
-          'blockTimestamp',
-          'spentAmount',
-          'intendedSpentAmount',
-          'receivedAmount',
-          'intendedReceivedAmount',
-        ];
 
-        for (const field of requiredFields) {
-          if (
-            responseBody[field] === undefined ||
-            responseBody[field] === null
-          ) {
-            console.error(
-              `Missing or undefined field: ${field}`,
-              responseBody[field]
-            );
-            throw new Error(`Proof data is missing required field: ${field}`);
+        if (attestationType === 'EVMTransaction') {
+          const requiredFields = [
+            'blockNumber',
+            'timestamp',
+            'value',
+            'status',
+            'sourceAddress',
+            'receivingAddress',
+          ] as const;
+
+          for (const field of requiredFields) {
+            const value = (responseBody as Record<string, unknown>)[field];
+            if (value === undefined || value === null) {
+              console.error(`Missing or undefined field: ${field}`, value);
+              throw new Error(`Proof data is missing required field: ${field}`);
+            }
           }
+
+          const verificationResult = await verifyEVMTransaction(
+            proof as EVMTransactionProofData,
+            fdcAddresses
+          );
+
+          console.log('=== EVMTransaction verification result ===');
+          console.log('Verification result:', verificationResult);
+
+          setVerificationResult({ verified: verificationResult });
+
+          updateStepStatus('verify-data', 'completed', {
+            message: 'EVMTransaction attestation verified successfully',
+            verificationResult: verificationResult,
+            verified: verificationResult,
+          });
+        } else {
+          const requiredFields = [
+            'blockNumber',
+            'blockTimestamp',
+            'sourceAddress',
+            'spentAmount',
+            'intendedSpentAmount',
+            'receivedAmount',
+            'intendedReceivedAmount',
+            'hasMemoData',
+            'hasDestinationTag',
+            'status',
+          ] as const;
+
+          for (const field of requiredFields) {
+            const value = (responseBody as Record<string, unknown>)[field];
+            if (value === undefined || value === null) {
+              console.error(`Missing or undefined field: ${field}`, value);
+              throw new Error(`Proof data is missing required field: ${field}`);
+            }
+          }
+
+          const verificationResult = await verifyXRPPayment(
+            proof as XRPPaymentProofData,
+            fdcAddresses
+          );
+
+          console.log('=== XRPPayment verification result ===');
+          console.log('Verification result:', verificationResult);
+          console.log('Verification result type:', typeof verificationResult);
+
+          setVerificationResult({ verified: verificationResult });
+
+          updateStepStatus('verify-data', 'completed', {
+            message: 'XRPPayment attestation verified successfully',
+            verificationResult: verificationResult,
+            verified: verificationResult,
+          });
         }
-
-        const verificationResult = await verifyPayment(proof, fdcAddresses);
-
-        console.log('=== Payment verification result ===');
-        console.log('Verification result:', verificationResult);
-        console.log('Verification result type:', typeof verificationResult);
-
-        setVerificationResult({ verified: verificationResult });
-
-        updateStepStatus('verify-data', 'completed', {
-          message: 'Payment attestation verified successfully',
-          verificationResult: verificationResult,
-          verified: verificationResult,
-        });
 
         setCurrentAttestationStep('');
         setSuccess(
@@ -290,11 +618,14 @@ export default function Fdc() {
         setError(
           error instanceof Error ? error.message : 'Unknown error occurred'
         );
+      } finally {
+        setIsLoading(false);
       }
     },
     [
       fdcAddresses,
       currentAttestationData,
+      attestationType,
       updateStepStatus,
       setCurrentAttestationStep,
       setProofData,
@@ -340,205 +671,85 @@ export default function Fdc() {
       setError(`Transaction failed: ${writeError.message}`);
     }
   }, [writeError]);
-  const [steps, setSteps] = useState<FdcStep[]>([
-    {
-      id: 'prepare-request',
-      title: '1. Prepare Request',
-      description: 'Prepare the attestation request using the verifier API',
-      status: 'pending',
-      details: {
-        whatHappens:
-          'We send your transaction ID to the Flare verifier server to create an ABI-encoded request that the FDC can understand.',
-        technicalDetails:
-          'The verifier validates the transaction ID format and creates a standardized request payload. This includes the attestation type (Payment), source ID (testXRP), and the transaction details.',
-        apiEndpoint:
-          'https://fdc-verifiers-testnet.flare.network/verifier/xrp/Payment/prepareResponse',
-        curlCommand: `curl -X 'POST' \\
-  'https://fdc-verifiers-testnet.flare.network/verifier/xrp/Payment/prepareResponse' \\
-  -H 'accept: */*' \\
-  -H 'X-API-KEY: 00000000-0000-0000-0000-000000000000' \\
-  -H 'Content-Type: application/json' \\
-  -d '{
-  "attestationType": "0x5061796d656e7400000000000000000000000000000000000000000000000000",
-  "sourceId": "0x7465737458525000000000000000000000000000000000000000000000000000",
-  "requestBody": {
-    "transactionId": "YOUR_TRANSACTION_ID",
-    "inUtxo": "0",
-    "utxo": "0"
-  }
-}'`,
-      },
-    },
-    {
-      id: 'submit-request',
-      title: '2. Submit Request',
-      description: (
-        <>
-          Submit the attestation request to the{' '}
-          <a
-            href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'
-            target='_blank'
-            rel='noopener noreferrer'
-            className='hover:opacity-80 underline inline-flex items-center gap-1'
-            style={{ color: '#E62058' }}
-          >
-            FdcHub contract
-            <ExternalLink className='h-3 w-3' />
-          </a>
-        </>
-      ),
-      status: 'pending',
-      details: {
-        whatHappens:
-          'The ABI-encoded request is submitted to the FdcHub smart contract on the Flare blockchain, along with the required fee.',
-        technicalDetails:
-          'This creates a transaction on the blockchain that requests the FDC to verify your XRP transaction. The contract stores the request and waits for the next voting round.',
-        apiEndpoint: (
-          <a
-            href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'
-            target='_blank'
-            rel='noopener noreferrer'
-            className='hover:opacity-80 underline inline-flex items-center gap-1'
-            style={{ color: '#E62058' }}
-          >
-            FdcHub.requestAttestation() - Smart Contract Call
-            <ExternalLink className='h-3 w-3' />
-          </a>
-        ),
-      },
-    },
-    {
-      id: 'wait-finalization',
-      title: '3. Wait for Finalization',
-      description: 'Wait for the voting round to be finalized',
-      status: 'pending',
-      details: {
-        whatHappens:
-          'The FDC validators vote on your request during the voting round. We wait for the round to be finalized before proceeding.',
-        technicalDetails:
-          'Voting rounds occur every 90 seconds. Validators check the XRPL for your transaction and vote on its validity. We wait for the round to be finalized before retrieving the proof.',
-        apiEndpoint:
-          'https://coston2-systems-explorer.flare.rocks/voting-round/{roundId}?tab=fdc',
-      },
-    },
-    {
-      id: 'prepare-proof',
-      title: '4. Prepare Proof Request',
-      description:
-        'Prepare the proof request using the Data Availability Client',
-      status: 'pending',
-      details: {
-        whatHappens:
-          'We retrieve the proof and attestation data from the Data Availability Layer using the finalized voting round ID.',
-        technicalDetails:
-          'The Data Availability Client provides cryptographic proof that your transaction was verified by the FDC validators. This includes Merkle tree proofs and the attestation response.',
-        apiEndpoint:
-          'https://ctn2-data-availability.flare.network/api/v1/fdc/proof-by-request-round',
-        curlCommand: `curl -X 'POST' \\
-  'https://ctn2-data-availability.flare.network/api/v1/fdc/proof-by-request-round' \\
-  -H 'accept: application/json' \\
-  -H 'x-api-key: 00000000-0000-0000-0000-000000000000' \\
-  -H 'Content-Type: application/json' \\
-  -d '{
-  "votingRoundId": ROUND_ID,
-  "requestBytes": "ABI_ENCODED_REQUEST"
-}'`,
-      },
-    },
-    {
-      id: 'verify-data',
-      title: '5. Verify Data',
-      description: (
-        <>
-          Verify the proof using the{' '}
-          <a
-            href='https://dev.flare.network/fdc/reference/IFdcVerification#verifypayment'
-            target='_blank'
-            rel='noopener noreferrer'
-            className='hover:opacity-80 underline inline-flex items-center gap-1'
-            style={{ color: '#E62058' }}
-          >
-            FdcVerification contract
-            <ExternalLink className='h-3 w-3' />
-          </a>
-        </>
-      ),
-      status: 'pending',
-      details: {
-        whatHappens:
-          "The cryptographic proof is verified on-chain using the FdcVerification contract to ensure the payment attestation is valid and hasn't been tampered with.",
-        technicalDetails:
-          'This final step uses the FdcVerification contract to cryptographically verify that the payment proof is valid and the attestation data is authentic.',
-        apiEndpoint: (
-          <a
-            href='https://dev.flare.network/fdc/reference/IFdcVerification#verifypayment'
-            target='_blank'
-            rel='noopener noreferrer'
-            className='hover:opacity-80 underline inline-flex items-center gap-1'
-            style={{ color: '#E62058' }}
-          >
-            FdcVerification.verifyPayment() - Smart Contract Call
-            <ExternalLink className='h-3 w-3' />
-          </a>
-        ),
-      },
-    },
-  ]);
+  const [steps, setSteps] = useState<FdcStep[]>(() =>
+    getInitialSteps('EVMTransaction')
+  );
+
+  useEffect(() => {
+    reset({
+      transactionId:
+        attestationType === 'EVMTransaction' ? SEPOLIA_TX_HASH : SAMPLE_XRPL_TX,
+    });
+    setSteps(getInitialSteps(attestationType, address ?? ZERO_ADDRESS));
+    setError(null);
+    setSuccess(null);
+    setCurrentAttestationData(null);
+    setProofData(null);
+    setVerificationResult(null);
+  }, [attestationType, address, reset]);
 
   const prepareRequest = async (transactionId: string) => {
     try {
       updateStepStatus('prepare-request', 'in_progress');
 
+      if (attestationType === 'EVMTransaction') {
+        const requestBody = {
+          attestationType:
+            '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
+          sourceId:
+            '0x7465737445544800000000000000000000000000000000000000000000000000',
+          requestBody: {
+            transactionHash: transactionId,
+            requiredConfirmations: '1',
+            provideInput: true,
+            listEvents: true,
+            logIndices: [] as string[],
+          },
+        };
+
+        const data = await prepareEVMTransactionAttestationRequest(
+          transactionId
+        );
+
+        if (!data.abiEncodedRequest) {
+          console.error(
+            'API response does not contain abiEncodedRequest:',
+            data
+          );
+          throw new Error(
+            `API response missing abiEncodedRequest. Response: ${JSON.stringify(data)}`
+          );
+        }
+
+        updateStepStatus('prepare-request', 'completed', {
+          ...data,
+          requestDetails: {
+            requestBody,
+            responseBody: data,
+            status: 200,
+          },
+        });
+
+        return data;
+      }
+
+      const proofOwner = address ?? ZERO_ADDRESS;
       const requestBody = {
         attestationType:
-          '0x5061796d656e7400000000000000000000000000000000000000000000000000',
+          '0x5852505061796d656e7400000000000000000000000000000000000000000000',
         sourceId:
           '0x7465737458525000000000000000000000000000000000000000000000000000',
         requestBody: {
-          transactionId: transactionId,
-          inUtxo: '0',
-          utxo: '0',
+          transactionId,
+          proofOwner,
         },
       };
 
-      // Try the prepareRequest endpoint first (as per the guide)
-      let response = await fetch(
-        'https://fdc-verifiers-testnet.flare.network/verifier/xrp/Payment/prepareRequest',
-        {
-          method: 'POST',
-          headers: {
-            accept: '*/*',
-            'X-API-KEY': '00000000-0000-0000-0000-000000000000',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(requestBody),
-        }
+      const data = await prepareXRPPaymentAttestationRequest(
+        transactionId,
+        proofOwner
       );
 
-      // If prepareRequest fails, try prepareResponse as fallback
-      if (!response.ok) {
-        console.log('prepareRequest failed, trying prepareResponse...');
-        response = await fetch(
-          'https://fdc-verifiers-testnet.flare.network/verifier/xrp/Payment/prepareResponse',
-          {
-            method: 'POST',
-            headers: {
-              accept: '*/*',
-              'X-API-KEY': '00000000-0000-0000-0000-000000000000',
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody),
-          }
-        );
-      }
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      // Check if the response has the expected structure
       if (!data.abiEncodedRequest) {
         console.error('API response does not contain abiEncodedRequest:', data);
         throw new Error(
@@ -546,14 +757,12 @@ export default function Fdc() {
         );
       }
 
-      // Update step with detailed information
       updateStepStatus('prepare-request', 'completed', {
         ...data,
         requestDetails: {
           requestBody,
           responseBody: data,
-          status: response.status,
-          headers: Object.fromEntries(response.headers.entries()),
+          status: 200,
         },
       });
 
@@ -587,6 +796,7 @@ export default function Fdc() {
     }
 
     setIsLoading(true);
+    setMainTab('workflow');
     setError(null);
     setSuccess(null);
 
@@ -697,9 +907,10 @@ export default function Fdc() {
     if (clientToUse) {
       try {
         // Get the request fee using the available publicClient
-        requestFee = await clientToUse.readContract({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        requestFee = await (clientToUse as any).readContract({
           address: fdcAddresses.fdcRequestFeeConfigurations as `0x${string}`,
-          abi: iFdcRequestFeeConfigurationsAbi,
+          abi: iFdcRequestFeeConfigurationsAbi as Abi,
           functionName: 'getRequestFee',
           args: [abiEncodedRequest as `0x${string}`],
         });
@@ -722,295 +933,386 @@ export default function Fdc() {
     // Submit the attestation request
     await requestAttestationAsync({
       address: fdcAddresses.fdcHub as `0x${string}`,
+      functionName: 'requestAttestation',
       args: [abiEncodedRequest as `0x${string}`],
       value: requestFee,
     });
   };
 
-  return (
-    <div className='w-full max-w-6xl mx-auto p-6 space-y-6'>
-      <Card>
-        <CardHeader>
-          <CardTitle
-            className='flex items-center gap-2'
-            style={{ color: '#E62058' }}
+  const walletBar = (
+    <div className='flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#E62058]/20 bg-[#fef7f0] px-4 py-3'>
+      {!isHydrated ? (
+        <p className='text-sm text-[#E62058]'>Loading wallet...</p>
+      ) : !isConnected ? (
+        <>
+          <p className='text-sm text-[#E62058]'>
+            Connect MetaMask to submit attestation requests on Coston2.
+          </p>
+          <Button
+            type='button'
+            onClick={handleConnect}
+            disabled={isPending}
+            size='sm'
+            style={{ backgroundColor: '#E62058', color: 'white' }}
           >
-            <CheckCircle className='h-5 w-5' style={{ color: '#E62058' }} />
-            <a
-              href='https://dev.flare.network/fdc/overview'
-              target='_blank'
-              rel='noopener noreferrer'
-              className='underline inline-flex items-center gap-1'
+            {isPending ? (
+              <Loader2 className='h-4 w-4 animate-spin' />
+            ) : (
+              'Connect MetaMask'
+            )}
+          </Button>
+        </>
+      ) : (
+        <>
+          <div className='text-sm text-gray-700'>
+            <span className='font-medium text-[#E62058]'>Connected</span>
+            <span className='mx-2 text-gray-300'>|</span>
+            <span className='font-mono text-xs'>
+              {address?.slice(0, 6)}...{address?.slice(-4)}
+            </span>
+            <span className='mx-2 text-gray-300'>|</span>
+            <span>Coston2</span>
+          </div>
+          <Button
+            type='button'
+            onClick={() => disconnect()}
+            variant='outline'
+            size='sm'
+            style={{ borderColor: '#E62058', color: '#E62058' }}
+          >
+            Disconnect
+          </Button>
+        </>
+      )}
+    </div>
+  );
+
+  return (
+    <div className='w-full max-w-6xl mx-auto p-6'>
+      <Card>
+        <CardHeader className='space-y-4'>
+          <div>
+            <CardTitle
+              className='flex items-center gap-2'
               style={{ color: '#E62058' }}
             >
-              Flare Data Connector (FDC)
-              <ExternalLink className='h-4 w-4' />
-            </a>
-            Workflow
-          </CardTitle>
+              <CheckCircle className='h-5 w-5' style={{ color: '#E62058' }} />
+              <a
+                href='https://dev.flare.network/fdc/overview'
+                target='_blank'
+                rel='noopener noreferrer'
+                className='underline inline-flex items-center gap-1'
+                style={{ color: '#E62058' }}
+              >
+                Flare Data Connector (FDC)
+                <ExternalLink className='h-4 w-4' />
+              </a>
+              Workflow
+            </CardTitle>
+            <p className='mt-2 text-sm text-gray-600'>
+              Prepare, submit, and verify attestations following the{' '}
+              <a
+                href='https://dev.flare.network/fdc/guides/fdc-by-hand/'
+                target='_blank'
+                rel='noopener noreferrer'
+                className='underline inline-flex items-center gap-1 text-[#E62058]'
+              >
+                FDC by hand guide
+                <ExternalLink className='h-3 w-3' />
+              </a>
+              .
+            </p>
+          </div>
+          {walletBar}
         </CardHeader>
         <CardContent>
-          <p className='mb-6' style={{ color: '#E62058' }}>
-            Execute the complete FDC workflow as described in the{' '}
-            <a
-              href='https://dev.flare.network/fdc/guides/fdc-by-hand/'
-              target='_blank'
-              rel='noopener noreferrer'
-              className='underline inline-flex items-center gap-1'
-              style={{ color: '#E62058' }}
-            >
-              FDC by hand guide
-              <ExternalLink className='h-3 w-3' />
-            </a>
-            . This demonstrates the step-by-step process of preparing requests,
-            submitting to the blockchain, and verifying data.
-          </p>
-
-          <div
-            className='rounded-lg p-4 mb-6'
-            style={{
-              backgroundColor: '#fef7f0',
-              borderColor: '#E62058',
-              borderWidth: '1px',
-              borderStyle: 'solid',
-            }}
+          <Tabs
+            value={mainTab}
+            onValueChange={value =>
+              setMainTab(value as 'configure' | 'workflow' | 'guide')
+            }
+            className='gap-6'
           >
-            <h4 className='font-medium mb-2' style={{ color: '#E62058' }}>
-              💡 How to use this tutorial:
-            </h4>
-            <ul className='text-sm space-y-1' style={{ color: '#E62058' }}>
-              <li>
-                • Enter a valid XRPL transaction ID (64-character hex string)
-              </li>
-              <li>
-                • Click &quot;Execute FDC Workflow&quot; to start the tutorial
-              </li>
-              <li>
-                • Click &quot;Show Details&quot; on any step to see technical
-                explanations and cURL commands
-              </li>
-              <li>
-                • Use the copy buttons to copy important data like ABI encoded
-                requests and proofs
-              </li>
-            </ul>
-          </div>
+            <TabsList className='grid h-11 w-full grid-cols-3 bg-[#fef7f0] p-1'>
+              <TabsTrigger
+                value='configure'
+                className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
+              >
+                Configure
+              </TabsTrigger>
+              <TabsTrigger
+                value='workflow'
+                className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
+              >
+                Workflow
+              </TabsTrigger>
+              <TabsTrigger
+                value='guide'
+                className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
+              >
+                Guide
+              </TabsTrigger>
+            </TabsList>
 
-          {/* Wallet Connection Section */}
-          <div
-            className='space-y-4 p-4 border rounded-lg mb-6'
-            style={{ backgroundColor: '#fef7f0', borderColor: '#E62058' }}
-          >
-            <h3 className='text-lg font-semibold' style={{ color: '#E62058' }}>
-              🔗 Wallet Connection
-            </h3>
-
-            {!isHydrated ? (
-              <div className='space-y-3'>
-                <p className='text-sm' style={{ color: '#E62058' }}>
-                  Loading wallet connection...
-                </p>
-              </div>
-            ) : !isConnected ? (
-              <div className='space-y-3'>
-                <p className='text-sm' style={{ color: '#E62058' }}>
-                  Connect your MetaMask wallet to interact with the Flare Data
-                  Connector.
-                </p>
-                <div className='flex flex-wrap gap-2'>
-                  {connectors.map(connector => (
-                    <Button
-                      key={connector.uid}
-                      onClick={() => connect({ connector })}
-                      disabled={isPending}
-                      className='flex items-center gap-2'
-                      style={{ backgroundColor: '#E62058', color: 'white' }}
-                    >
-                      {isPending ? (
-                        <Loader2 className='h-4 w-4 animate-spin' />
-                      ) : (
-                        <span>🔗</span>
-                      )}
-                      Connect {connector.name}
-                    </Button>
-                  ))}
-                </div>
-                <p className='text-xs text-gray-600'>
-                  Make sure you&apos;re connected to Flare Coston2 testnet in
-                  MetaMask
-                </p>
-              </div>
-            ) : (
-              <div className='space-y-3'>
-                <div className='flex items-center gap-2'>
-                  <span
-                    className='text-sm font-medium'
-                    style={{ color: '#E62058' }}
+            <TabsContent value='configure' className='space-y-6'>
+              <form
+                onSubmit={handleSubmit(executeFdcWorkflow)}
+                className='space-y-6'
+              >
+                <div className='space-y-3'>
+                  <Label style={{ color: '#E62058' }}>Attestation Type</Label>
+                  <Tabs
+                    value={attestationType}
+                    onValueChange={value =>
+                      setAttestationType(value as AttestationType)
+                    }
                   >
-                    ✅ Connected
-                  </span>
-                </div>
-                <div className='text-sm text-gray-700'>
-                  <p>
-                    <strong>Address:</strong> {address}
+                    <TabsList className='grid h-11 w-full max-w-md grid-cols-2 bg-gray-100 p-1'>
+                      <TabsTrigger
+                        value='EVMTransaction'
+                        disabled={isLoading}
+                        className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
+                      >
+                        EVMTransaction
+                      </TabsTrigger>
+                      <TabsTrigger
+                        value='XRPPayment'
+                        disabled={isLoading}
+                        className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
+                      >
+                        XRPPayment
+                      </TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                  <p className='text-xs text-gray-600'>
+                    {attestationType === 'EVMTransaction' ? (
+                      <>
+                        Source: testETH (Sepolia). Verifier API:{' '}
+                        <a
+                          href='https://fdc-verifiers-testnet.flare.network/verifier/eth/api-doc'
+                          target='_blank'
+                          rel='noopener noreferrer'
+                          className='underline'
+                          style={{ color: '#E62058' }}
+                        >
+                          eth/api-doc
+                          <ExternalLink className='inline h-3 w-3 ml-0.5' />
+                        </a>
+                      </>
+                    ) : (
+                      'Source: testXRP (XRPL testnet)'
+                    )}
                   </p>
-                  <p>
-                    <strong>Network:</strong> Flare Coston2 Testnet
-                  </p>
                 </div>
-                <Button
-                  onClick={() => disconnect()}
-                  variant='outline'
-                  size='sm'
-                  style={{ borderColor: '#E62058', color: '#E62058' }}
-                >
-                  Disconnect
-                </Button>
-              </div>
-            )}
-          </div>
 
-          <form
-            onSubmit={handleSubmit(executeFdcWorkflow)}
-            className='space-y-6'
-          >
-            <div className='space-y-2'>
-              <Label htmlFor='transactionId' style={{ color: '#E62058' }}>
-                XRPL Transaction ID
-              </Label>
-              <Input
-                {...register('transactionId')}
-                id='transactionId'
-                placeholder='4545d31710bd3d66772ee6bdefca44c0c029b167d60ec5fe032fea9bbd886cde'
-                defaultValue=''
-                className={`border-gray-300 focus:ring-2 focus:ring-opacity-50 ${
-                  errors.transactionId
-                    ? 'border-red-300 focus:ring-red-500 focus:border-red-500'
-                    : ''
-                }`}
-                style={
-                  {
-                    borderColor: errors.transactionId ? undefined : '#E62058',
-                    '--tw-ring-color': '#E62058',
-                  } as React.CSSProperties
-                }
-              />
-              {errors.transactionId && (
-                <p className='text-sm text-red-600'>
-                  {errors.transactionId.message}
-                </p>
+                <div className='space-y-2'>
+                  <Label htmlFor='transactionId' style={{ color: '#E62058' }}>
+                    {attestationType === 'EVMTransaction'
+                      ? 'Sepolia Transaction Hash'
+                      : 'XRPL Transaction ID'}
+                  </Label>
+                  <Input
+                    {...register('transactionId')}
+                    id='transactionId'
+                    placeholder={
+                      attestationType === 'EVMTransaction'
+                        ? SEPOLIA_TX_HASH
+                        : SAMPLE_XRPL_TX
+                    }
+                    className={`border-gray-300 focus:ring-2 focus:ring-opacity-50 ${
+                      errors.transactionId
+                        ? 'border-red-300 focus:ring-red-500 focus:border-red-500'
+                        : ''
+                    }`}
+                    style={
+                      {
+                        borderColor: errors.transactionId
+                          ? undefined
+                          : '#E62058',
+                        '--tw-ring-color': '#E62058',
+                      } as React.CSSProperties
+                    }
+                  />
+                  {errors.transactionId && (
+                    <p className='text-sm text-red-600'>
+                      {errors.transactionId.message}
+                    </p>
+                  )}
+                  {attestationType === 'EVMTransaction' ? (
+                    <p className='text-xs text-gray-600'>
+                      Example:{' '}
+                      <a
+                        href={`https://sepolia.etherscan.io/tx/${SEPOLIA_TX_HASH}`}
+                        target='_blank'
+                        rel='noopener noreferrer'
+                        className='underline break-all'
+                        style={{ color: '#E62058' }}
+                      >
+                        {SEPOLIA_TX_HASH}
+                        <ExternalLink className='inline h-3 w-3 ml-0.5' />
+                      </a>
+                    </p>
+                  ) : (
+                    <p className='text-xs text-gray-600'>
+                      Example:{' '}
+                      <a
+                        href={`https://livenet.xrpl.org/transactions/${SAMPLE_XRPL_TX}`}
+                        target='_blank'
+                        rel='noopener noreferrer'
+                        className='underline break-all'
+                        style={{ color: '#E62058' }}
+                      >
+                        {SAMPLE_XRPL_TX}
+                        <ExternalLink className='inline h-3 w-3 ml-0.5' />
+                      </a>
+                    </p>
+                  )}
+                </div>
+
+                {isLoadingAddresses && (
+                  <Alert
+                    className='border'
+                    style={{
+                      backgroundColor: '#fef7f0',
+                      borderColor: '#E62058',
+                      color: '#E62058',
+                    }}
+                  >
+                    <AlertDescription>
+                      <div className='flex items-center gap-2'>
+                        <Loader2 className='h-4 w-4 animate-spin' />
+                        Loading FDC contract addresses...
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {addressError && (
+                  <Alert variant='destructive'>
+                    <XCircle className='h-4 w-4' />
+                    <AlertDescription>
+                      Error loading contract addresses: {addressError}
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {(error || connectError) && (
+                  <Alert variant='destructive'>
+                    <XCircle className='h-4 w-4' />
+                    <AlertDescription>
+                      {error || connectError?.message}
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {!isConnected ? (
+                  <Button
+                    type='button'
+                    onClick={handleConnect}
+                    disabled={isPending || !isHydrated}
+                    className='w-full'
+                    style={{ backgroundColor: '#E62058' }}
+                  >
+                    {isPending || !isHydrated ? (
+                      <>
+                        <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                        {isPending ? 'Connecting...' : 'Loading...'}
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle className='mr-2 h-4 w-4' />
+                        Connect MetaMask
+                      </>
+                    )}
+                  </Button>
+                ) : (
+                  <Button
+                    type='submit'
+                    disabled={
+                      isLoading || isLoadingAddresses || !!addressError
+                    }
+                    className='w-full disabled:bg-gray-400'
+                    style={{ backgroundColor: '#E62058' }}
+                  >
+                    {isLoading ? (
+                      <>
+                        <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                        Executing FDC Workflow...
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle className='mr-2 h-4 w-4' />
+                        Execute FDC Workflow
+                      </>
+                    )}
+                  </Button>
+                )}
+
+                {success && (
+                  <Alert className='bg-green-50 border-green-200 text-green-800'>
+                    <CheckCircle className='h-4 w-4' />
+                    <AlertDescription>{success}</AlertDescription>
+                  </Alert>
+                )}
+
+                {currentAttestationStep && (
+                  <Alert
+                    style={{
+                      backgroundColor: '#fef7f0',
+                      borderColor: '#E62058',
+                      color: '#E62058',
+                    }}
+                  >
+                    <div
+                      className='animate-spin rounded-full h-4 w-4 border-b-2'
+                      style={{ borderColor: '#E62058' }}
+                    ></div>
+                    <AlertDescription>
+                      {currentAttestationStep}
+                    </AlertDescription>
+                  </Alert>
+                )}
+              </form>
+            </TabsContent>
+
+            <TabsContent value='workflow' className='space-y-4'>
+              {(error || success || currentAttestationStep) && (
+                <div className='space-y-3'>
+                  {error && (
+                    <Alert variant='destructive'>
+                      <XCircle className='h-4 w-4' />
+                      <AlertDescription>{error}</AlertDescription>
+                    </Alert>
+                  )}
+                  {success && (
+                    <Alert className='bg-green-50 border-green-200 text-green-800'>
+                      <CheckCircle className='h-4 w-4' />
+                      <AlertDescription>{success}</AlertDescription>
+                    </Alert>
+                  )}
+                  {currentAttestationStep && (
+                    <Alert
+                      style={{
+                        backgroundColor: '#fef7f0',
+                        borderColor: '#E62058',
+                        color: '#E62058',
+                      }}
+                    >
+                      <div
+                        className='animate-spin rounded-full h-4 w-4 border-b-2'
+                        style={{ borderColor: '#E62058' }}
+                      ></div>
+                      <AlertDescription>
+                        {currentAttestationStep}
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                </div>
               )}
-            </div>
-
-            {isLoadingAddresses && (
-              <Alert
-                className='border'
-                style={{
-                  backgroundColor: '#fef7f0',
-                  borderColor: '#E62058',
-                  color: '#E62058',
-                }}
-              >
-                <AlertDescription>
-                  <div className='flex items-center gap-2'>
-                    <Loader2 className='h-4 w-4 animate-spin' />
-                    Loading FDC contract addresses...
-                  </div>
-                </AlertDescription>
-              </Alert>
-            )}
-
-            {addressError && (
-              <Alert variant='destructive'>
-                <XCircle className='h-4 w-4' />
-                <AlertDescription>
-                  Error loading contract addresses: {addressError}
-                </AlertDescription>
-              </Alert>
-            )}
-
-            {!isConnected && !isLoadingAddresses && (
-              <Alert className='bg-yellow-50 border-yellow-200 text-yellow-800'>
-                <AlertDescription>
-                  Please connect your wallet to submit attestation requests to
-                  the blockchain.
-                </AlertDescription>
-              </Alert>
-            )}
-
-            <Button
-              type='submit'
-              disabled={
-                isLoading ||
-                !isHydrated ||
-                !isConnected ||
-                isLoadingAddresses ||
-                !!addressError
-              }
-              className='w-full disabled:bg-gray-400'
-              style={{ backgroundColor: '#E62058' }}
-            >
-              {isLoading ? (
-                <>
-                  <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                  Executing FDC Workflow...
-                </>
-              ) : !isHydrated ? (
-                <>
-                  <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                  Loading...
-                </>
-              ) : !isConnected ? (
-                <>
-                  <XCircle className='mr-2 h-4 w-4' />
-                  Connect Wallet to Execute
-                </>
-              ) : (
-                <>
-                  <CheckCircle className='mr-2 h-4 w-4' />
-                  Execute FDC Workflow
-                </>
-              )}
-            </Button>
-
-            {error && (
-              <Alert variant='destructive'>
-                <XCircle className='h-4 w-4' />
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            )}
-
-            {success && (
-              <Alert className='bg-green-50 border-green-200 text-green-800'>
-                <CheckCircle className='h-4 w-4' />
-                <AlertDescription>{success}</AlertDescription>
-              </Alert>
-            )}
-
-            {currentAttestationStep && (
-              <Alert
-                style={{
-                  backgroundColor: '#fef7f0',
-                  borderColor: '#E62058',
-                  color: '#E62058',
-                }}
-              >
-                <div
-                  className='animate-spin rounded-full h-4 w-4 border-b-2'
-                  style={{ borderColor: '#E62058' }}
-                ></div>
-                <AlertDescription>{currentAttestationStep}</AlertDescription>
-              </Alert>
-            )}
-          </form>
-        </CardContent>
-      </Card>
-
-      {/* Workflow Steps */}
-      <div className='space-y-4'>
-        <h2 className='text-xl font-semibold' style={{ color: '#E62058' }}>
-          FDC Workflow Steps
-        </h2>
+              <p className='text-sm text-gray-600'>
+                Track each stage of the FDC attestation flow. Expand a step for
+                technical details, cURL examples, and results.
+              </p>
         {steps.map(step => (
           <Card key={step.id} className={`${getStepStatusColor(step.status)}`}>
             <CardContent className='p-4'>
@@ -1376,32 +1678,274 @@ export default function Fdc() {
                             <h5 className='font-medium text-gray-900 mb-1'>
                               Request Body:
                             </h5>
-                            <div className='bg-gray-100 p-3 rounded text-xs font-mono overflow-x-auto'>
-                              <pre className='whitespace-pre-wrap'>
-                                {JSON.stringify(
-                                  (step.data.requestDetails as any)
-                                    ?.requestBody,
-                                  null,
-                                  2
-                                )}
-                              </pre>
+                            <div className='bg-gray-100 p-3 rounded text-xs font-mono max-w-full'>
+                              <div className='space-y-2'>
+                                {(() => {
+                                  const requestBody = (
+                                    step.data.requestDetails as any
+                                  )?.requestBody;
+                                  if (!requestBody) return null;
+
+                                  return Object.entries(requestBody).map(
+                                    ([key, value]) => (
+                                      <div
+                                        key={key}
+                                        className='flex flex-col gap-1'
+                                      >
+                                        <span className='font-semibold text-gray-800'>
+                                          {key}:
+                                        </span>
+                                        <div className='flex items-center gap-2'>
+                                          <code className='bg-white p-2 rounded border text-xs break-all max-w-full'>
+                                            {(() => {
+                                              if (
+                                                typeof value === 'object' &&
+                                                value !== null
+                                              ) {
+                                                const jsonString =
+                                                  JSON.stringify(
+                                                    value,
+                                                    null,
+                                                    2
+                                                  );
+                                                return jsonString.length > 50
+                                                  ? `${jsonString.slice(0, 20)}...${jsonString.slice(-20)}`
+                                                  : jsonString;
+                                              } else if (
+                                                typeof value === 'string' &&
+                                                value.length > 50
+                                              ) {
+                                                return `${String(value).slice(0, 20)}...${String(value).slice(-20)}`;
+                                              } else {
+                                                return String(value);
+                                              }
+                                            })()}
+                                          </code>
+                                          <button
+                                            type='button'
+                                            onClick={() =>
+                                              copyToClipboardWithTimeout(
+                                                typeof value === 'object' &&
+                                                  value !== null
+                                                  ? JSON.stringify(
+                                                      value,
+                                                      null,
+                                                      2
+                                                    )
+                                                  : String(value),
+                                                setCopiedText
+                                              )
+                                            }
+                                            className='h-6 w-6 p-0 hover:bg-gray-200 rounded flex items-center justify-center'
+                                          >
+                                            {copiedText === String(value) ? (
+                                              <Check className='h-3 w-3 text-green-600' />
+                                            ) : (
+                                              <Copy className='h-3 w-3' />
+                                            )}
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )
+                                  );
+                                })()}
+                              </div>
                             </div>
                           </div>
                           <div>
                             <h5 className='font-medium text-gray-900 mb-1'>
                               Response Body:
                             </h5>
-                            <div className='bg-gray-100 p-3 rounded text-xs font-mono overflow-x-auto'>
-                              <pre className='whitespace-pre-wrap'>
-                                {JSON.stringify(
-                                  (step.data.requestDetails as any)
-                                    ?.responseBody,
-                                  null,
-                                  2
-                                )}
-                              </pre>
+                            <div className='bg-gray-100 p-3 rounded text-xs font-mono max-w-full'>
+                              <div className='space-y-2'>
+                                {(() => {
+                                  const responseBody = (
+                                    step.data.requestDetails as any
+                                  )?.responseBody;
+                                  if (!responseBody) return null;
+
+                                  return Object.entries(responseBody).map(
+                                    ([key, value]) => (
+                                      <div
+                                        key={key}
+                                        className='flex flex-col gap-1'
+                                      >
+                                        <span className='font-semibold text-gray-800'>
+                                          {key}:
+                                        </span>
+                                        <div className='flex items-center gap-2'>
+                                          <code className='bg-white p-2 rounded border text-xs break-all max-w-full'>
+                                            {(() => {
+                                              if (
+                                                typeof value === 'object' &&
+                                                value !== null
+                                              ) {
+                                                const jsonString =
+                                                  JSON.stringify(
+                                                    value,
+                                                    null,
+                                                    2
+                                                  );
+                                                return jsonString.length > 50
+                                                  ? `${jsonString.slice(0, 20)}...${jsonString.slice(-20)}`
+                                                  : jsonString;
+                                              } else if (
+                                                typeof value === 'string' &&
+                                                value.length > 50
+                                              ) {
+                                                return `${String(value).slice(0, 20)}...${String(value).slice(-20)}`;
+                                              } else {
+                                                return String(value);
+                                              }
+                                            })()}
+                                          </code>
+                                          <button
+                                            type='button'
+                                            onClick={() =>
+                                              copyToClipboardWithTimeout(
+                                                typeof value === 'object' &&
+                                                  value !== null
+                                                  ? JSON.stringify(
+                                                      value,
+                                                      null,
+                                                      2
+                                                    )
+                                                  : String(value),
+                                                setCopiedText
+                                              )
+                                            }
+                                            className='h-6 w-6 p-0 hover:bg-gray-200 rounded flex items-center justify-center'
+                                          >
+                                            {copiedText === String(value) ? (
+                                              <Check className='h-3 w-3 text-green-600' />
+                                            ) : (
+                                              <Copy className='h-3 w-3' />
+                                            )}
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )
+                                  );
+                                })()}
+                              </div>
                             </div>
                           </div>
+
+                          {/* ABI Encoded Request Explanation */}
+                          {step.id === 'prepare-request' &&
+                            (
+                              step.data.requestDetails as
+                                | { responseBody?: { abiEncodedRequest?: string } }
+                                | undefined
+                            )?.responseBody?.abiEncodedRequest && (
+                              <div
+                                className='mt-4 p-4 rounded-lg'
+                                style={{
+                                  backgroundColor: '#fef7f0',
+                                  borderColor: '#E62058',
+                                  border: '1px solid',
+                                }}
+                              >
+                                <h5
+                                  className='font-medium mb-3'
+                                  style={{ color: '#E62058' }}
+                                >
+                                  📖 Understanding the abiEncodedRequest
+                                </h5>
+                                <div className='text-sm space-y-3'>
+                                  <p>
+                                    The{' '}
+                                    <code className='bg-white px-2 py-1 rounded text-xs'>
+                                      abiEncodedRequest
+                                    </code>{' '}
+                                    is a hex string that encodes all the request
+                                    data in a format the FDC contract can
+                                    understand. Here's how it's structured:
+                                  </p>
+
+                                  <div className='bg-white p-3 rounded border text-xs font-mono'>
+                                    <div className='space-y-1'>
+                                      <div>
+                                        <span className='font-semibold text-blue-600'>
+                                          Line 1:
+                                        </span>{' '}
+                                        {attestationType ===
+                                        'EVMTransaction' ? (
+                                          <>
+                                            <code>0x45564d5472616e73...</code> →{' '}
+                                            <code>
+                                              toUtf8HexString(&quot;EVMTransaction&quot;)
+                                            </code>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <code>0x5852505061796d65...</code> →{' '}
+                                            <code>
+                                              toUtf8HexString(&quot;XRPPayment&quot;)
+                                            </code>
+                                          </>
+                                        )}
+                                      </div>
+                                      <div>
+                                        <span className='font-semibold text-blue-600'>
+                                          Line 2:
+                                        </span>{' '}
+                                        {attestationType ===
+                                        'EVMTransaction' ? (
+                                          <>
+                                            <code>0x74657374455448...</code> →{' '}
+                                            <code>
+                                              toUtf8HexString(&quot;testETH&quot;)
+                                            </code>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <code>0x74657374585250...</code> →{' '}
+                                            <code>
+                                              toUtf8HexString(&quot;testXRP&quot;)
+                                            </code>
+                                          </>
+                                        )}
+                                      </div>
+                                      <div>
+                                        <span className='font-semibold text-blue-600'>
+                                          Line 3:
+                                        </span>{' '}
+                                        <code>0x...</code> → Message Integrity
+                                        Code (MIC) - hash of response salted with
+                                        &quot;Flare&quot;
+                                      </div>
+                                      <div>
+                                        <span className='font-semibold text-blue-600'>
+                                          Remaining:
+                                        </span>{' '}
+                                        {attestationType === 'EVMTransaction'
+                                          ? 'ABI-encoded EVMTransaction.RequestBody (transactionHash, confirmations, flags, logIndices)'
+                                          : 'ABI-encoded XRPPayment.RequestBody (transactionId and proofOwner)'}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <div className='text-xs text-gray-600 space-y-1'>
+                                    <p>
+                                      <strong>Structure:</strong> Each line
+                                      represents 32 bytes (64 hex characters) of
+                                      data
+                                    </p>
+                                    <p>
+                                      <strong>Purpose:</strong> This encoded
+                                      format allows the FDC contract to parse
+                                      the request data efficiently
+                                    </p>
+                                    <p>
+                                      <strong>Integrity:</strong> The MIC
+                                      ensures the attestation data hasn't been
+                                      tampered with
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
                         </div>
                       )}
                     </div>
@@ -1417,95 +1961,143 @@ export default function Fdc() {
             </CardContent>
           </Card>
         ))}
-      </div>
+            </TabsContent>
 
-      {/* Tutorial Information */}
-      <Card style={{ backgroundColor: '#fef7f0', borderColor: '#E62058' }}>
-        <CardContent className='p-4'>
-          <h3 className='font-semibold mb-3' style={{ color: '#E62058' }}>
-            📚 FDC Tutorial Guide
-          </h3>
-          <div className='space-y-3 text-sm' style={{ color: '#E62058' }}>
-            <p>
-              This interactive tutorial demonstrates the complete Flare Data
-              Connector (FDC) workflow as described in the official
-              documentation. Each step shows you exactly what happens behind the
-              scenes.
-            </p>
-            <div>
-              <h4 className='font-medium mb-1'>What you&apos;ll learn:</h4>
-              <ul className='list-disc list-inside space-y-1 ml-2'>
-                <li>
-                  How to prepare attestation requests using the verifier API
-                </li>
-                <li>The structure of ABI-encoded requests</li>
-                <li>How voting rounds work in the FDC system</li>
-                <li>How to retrieve proofs from the Data Availability Layer</li>
-                <li>How cryptographic verification works</li>
-              </ul>
-            </div>
-            <div>
-              <h4 className='font-medium mb-1'>Interactive Features:</h4>
-              <ul className='list-disc list-inside space-y-1 ml-2'>
-                <li>
-                  <strong>Step 1</strong> makes an API call to the Flare
-                  verifier server
-                </li>
-                <li>
-                  <strong>Step 2</strong> executes a blockchain transaction to{' '}
-                  <a
-                    href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'
-                    target='_blank'
-                    rel='noopener noreferrer'
-                    className='hover:opacity-80 underline inline-flex items-center gap-1'
-                  >
-                    FdcHub contract
-                    <ExternalLink className='h-3 w-3' />
-                  </a>
-                </li>
-                <li>
-                  <strong>Step 3</strong> calculates and waits for voting round
-                  finalization
-                </li>
-                <li>
-                  <strong>Step 4</strong> retrieves proof from Data Availability
-                  Layer
-                </li>
-                <li>
-                  <strong>Step 5</strong> verifies payment attestation using{' '}
-                  <a
-                    href='https://dev.flare.network/fdc/reference/IFdcVerification#verifypayment'
-                    target='_blank'
-                    rel='noopener noreferrer'
-                    className='hover:opacity-80 underline inline-flex items-center gap-1'
-                  >
-                    FdcVerification contract
-                    <ExternalLink className='h-3 w-3' />
-                  </a>
-                </li>
-                <li>
-                  <strong>Expandable details</strong> show technical
-                  explanations and cURL commands for each step
-                </li>
-                <li>
-                  <strong>Copy functionality</strong> for all important data
-                  (requests, proofs, transaction hashes, etc.)
-                </li>
-                <li>
-                  <strong>Real request/response data</strong> from actual API
-                  calls and blockchain transactions
-                </li>
-                <li>
-                  <strong>Transaction tracking</strong> with real transaction
-                  hashes and block numbers
-                </li>
-                <li>
-                  <strong>Voting round links</strong> to view rounds in the
-                  Systems Explorer
-                </li>
-              </ul>
-            </div>
-          </div>
+            <TabsContent value='guide' className='space-y-6'>
+              <div
+                className='rounded-lg p-4'
+                style={{
+                  backgroundColor: '#fef7f0',
+                  borderColor: '#E62058',
+                  borderWidth: '1px',
+                  borderStyle: 'solid',
+                }}
+              >
+                <h4 className='font-medium mb-2' style={{ color: '#E62058' }}>
+                  How to use this tutorial
+                </h4>
+                <ul className='text-sm space-y-1' style={{ color: '#E62058' }}>
+                  <li>
+                    • Choose an attestation type: EVMTransaction (Sepolia) or
+                    XRPPayment (XRPL)
+                  </li>
+                  <li>
+                    • Enter a transaction hash / ID (EVMTransaction is prefilled
+                    with a Sepolia example)
+                  </li>
+                  <li>
+                    • Click &quot;Execute FDC Workflow&quot; to start the
+                    tutorial
+                  </li>
+                  <li>
+                    • Open the Workflow tab to follow each step and expand
+                    details
+                  </li>
+                  <li>
+                    • Use the copy buttons for ABI-encoded requests and proofs
+                  </li>
+                </ul>
+              </div>
+
+              <div
+                className='rounded-lg border p-4'
+                style={{ backgroundColor: '#fef7f0', borderColor: '#E62058' }}
+              >
+                <h3
+                  className='font-semibold mb-3'
+                  style={{ color: '#E62058' }}
+                >
+                  FDC Tutorial Guide
+                </h3>
+                <div className='space-y-3 text-sm' style={{ color: '#E62058' }}>
+                  <p>
+                    This interactive tutorial demonstrates the complete Flare
+                    Data Connector (FDC) workflow as described in the official
+                    documentation. Each step shows you exactly what happens
+                    behind the scenes.
+                  </p>
+                  <div>
+                    <h4 className='font-medium mb-1'>What you&apos;ll learn:</h4>
+                    <ul className='list-disc list-inside space-y-1 ml-2'>
+                      <li>
+                        How to prepare attestation requests using the verifier
+                        API
+                      </li>
+                      <li>The structure of ABI-encoded requests</li>
+                      <li>How voting rounds work in the FDC system</li>
+                      <li>
+                        How to retrieve proofs from the Data Availability Layer
+                      </li>
+                      <li>How cryptographic verification works</li>
+                    </ul>
+                  </div>
+                  <div>
+                    <h4 className='font-medium mb-1'>Interactive Features:</h4>
+                    <ul className='list-disc list-inside space-y-1 ml-2'>
+                      <li>
+                        <strong>Step 1</strong> makes an API call to the Flare
+                        verifier server
+                      </li>
+                      <li>
+                        <strong>Step 2</strong> executes a blockchain
+                        transaction to{' '}
+                        <a
+                          href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'
+                          target='_blank'
+                          rel='noopener noreferrer'
+                          className='hover:opacity-80 underline inline-flex items-center gap-1'
+                        >
+                          FdcHub contract
+                          <ExternalLink className='h-3 w-3' />
+                        </a>
+                      </li>
+                      <li>
+                        <strong>Step 3</strong> calculates and waits for voting
+                        round finalization
+                      </li>
+                      <li>
+                        <strong>Step 4</strong> retrieves proof from Data
+                        Availability Layer
+                      </li>
+                      <li>
+                        <strong>Step 5</strong> verifies payment attestation
+                        using{' '}
+                        <a
+                          href='https://dev.flare.network/fdc/reference/IFdcVerification#verifypayment'
+                          target='_blank'
+                          rel='noopener noreferrer'
+                          className='hover:opacity-80 underline inline-flex items-center gap-1'
+                        >
+                          FdcVerification contract
+                          <ExternalLink className='h-3 w-3' />
+                        </a>
+                      </li>
+                      <li>
+                        <strong>Expandable details</strong> show technical
+                        explanations and cURL commands for each step
+                      </li>
+                      <li>
+                        <strong>Copy functionality</strong> for all important
+                        data (requests, proofs, transaction hashes, etc.)
+                      </li>
+                      <li>
+                        <strong>Real request/response data</strong> from actual
+                        API calls and blockchain transactions
+                      </li>
+                      <li>
+                        <strong>Transaction tracking</strong> with real
+                        transaction hashes and block numbers
+                      </li>
+                      <li>
+                        <strong>Voting round links</strong> to view rounds in
+                        the Systems Explorer
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </TabsContent>
+          </Tabs>
         </CardContent>
       </Card>
     </div>

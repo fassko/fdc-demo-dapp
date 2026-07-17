@@ -1,18 +1,15 @@
-// FDC contract addresses
+// FDC contract addresses via Flare Contract Registry
 // More info: https://dev.flare.network/fdc/overview
+// Registry guide: https://dev.flare.network/network/guides/flare-contracts-registry
 
-import { ethers } from 'ethers';
+import { iFlareContractRegistryAbi } from '@flarenetwork/flare-wagmi-periphery-package/contracts/coston2';
+import type { Abi } from 'viem';
 
-import { coston2 } from '@flarenetwork/flare-periphery-contract-artifacts';
+import { publicClient } from '@/lib/publicClient';
 
-// Helper function to extract contract address from result
-function extractContractAddress(
-  result: { address?: string } | string
-): `0x${string}` {
-  return (
-    typeof result === 'string' ? result : result.address
-  ) as `0x${string}`;
-}
+/** Same address on every Flare-family network */
+export const FLARE_CONTRACT_REGISTRY =
+  '0xaD67FE66660Fb8dFE9d6b1b4240d8650e30F6019' as const;
 
 export interface FdcContractAddresses {
   fdcHub: `0x${string}`;
@@ -21,50 +18,42 @@ export interface FdcContractAddresses {
   fdcVerification: `0x${string}`;
 }
 
+const getAddressByName = async (name: string): Promise<`0x${string}`> => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const address = await (publicClient as any).readContract({
+    address: FLARE_CONTRACT_REGISTRY,
+    abi: iFlareContractRegistryAbi as Abi,
+    functionName: 'getContractAddressByName',
+    args: [name],
+  });
+
+  if (!address || address === '0x0000000000000000000000000000000000000000') {
+    throw new Error(`Contract registry returned empty address for ${name}`);
+  }
+
+  return address as `0x${string}`;
+};
+
 export async function getFdcContractAddresses(): Promise<FdcContractAddresses> {
   try {
-    if (typeof window !== 'undefined' && window.ethereum) {
-      const provider = new ethers.BrowserProvider(window.ethereum);
+    const [
+      fdcHub,
+      fdcRequestFeeConfigurations,
+      flareSystemsManager,
+      fdcVerification,
+    ] = await Promise.all([
+      getAddressByName('FdcHub'),
+      getAddressByName('FdcRequestFeeConfigurations'),
+      getAddressByName('FlareSystemsManager'),
+      getAddressByName('FdcVerification'),
+    ]);
 
-      // Get FDC Hub address from Flare Contracts Registry
-      // https://dev.flare.network/network/guides/flare-contracts-registry
-      const fdcHub = coston2.products.FdcHub;
-      const fdcHubAddressResult = await fdcHub.getAddress(provider);
-
-      // Get FDC Request Fee Configurations address from Flare Contracts Registry
-      // https://dev.flare.network/network/guides/flare-contracts-registry
-      const fdcRequestFeeConfigurations =
-        coston2.products.FdcRequestFeeConfigurations;
-      const fdcRequestFeeConfigurationsAddressResult =
-        await fdcRequestFeeConfigurations.getAddress(provider);
-
-      // Get Flare Systems Manager address from Flare Contracts Registry
-      // https://dev.flare.network/network/guides/flare-contracts-registry
-      const flareSystemsManager = coston2.products.FlareSystemsManager;
-      const flareSystemsManagerAddressResult =
-        await flareSystemsManager.getAddress(provider);
-
-      // Get FDC Verification address from Flare Contracts Registry
-      // https://dev.flare.network/network/guides/flare-contracts-registry
-      const fdcVerification = coston2.products.FdcVerification;
-      const fdcVerificationAddressResult =
-        await fdcVerification.getAddress(provider);
-
-      return {
-        fdcHub: extractContractAddress(fdcHubAddressResult),
-        fdcRequestFeeConfigurations: extractContractAddress(
-          fdcRequestFeeConfigurationsAddressResult
-        ),
-        flareSystemsManager: extractContractAddress(
-          flareSystemsManagerAddressResult
-        ),
-        fdcVerification: extractContractAddress(fdcVerificationAddressResult),
-      };
-    } else {
-      throw new Error(
-        'MetaMask is not installed. Please install MetaMask to use this feature.'
-      );
-    }
+    return {
+      fdcHub,
+      fdcRequestFeeConfigurations,
+      flareSystemsManager,
+      fdcVerification,
+    };
   } catch (error) {
     console.error('Error getting FDC contract addresses:', error);
     throw error;

@@ -4,17 +4,33 @@
 import {
   iFdcRequestFeeConfigurationsAbi,
   iFlareSystemsManagerAbi,
-  iPaymentVerificationAbi,
+  ievmTransactionVerificationAbi,
   iReferencedPaymentNonexistenceVerificationAbi,
-} from '@/generated';
+  ixrpPaymentVerificationAbi,
+} from '@flarenetwork/flare-wagmi-periphery-package/contracts/coston2';
+import type { Abi } from 'viem';
 import { publicClient } from '@/lib/publicClient';
 import { toHex } from '@/lib/utils';
 
+/**
+ * Thin wrapper around publicClient.readContract.
+ * Needed because flare-wagmi-periphery-package ABI const types can collide with
+ * the app's viem ReadContractParameters (authorizationList required incorrectly).
+ */
+const readContract = async <T>(params: {
+  address: `0x${string}`;
+  abi: Abi;
+  functionName: string;
+  args?: readonly unknown[];
+}): Promise<T> => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (publicClient as any).readContract(params) as Promise<T>;
+};
+
 // Type definitions based on generated ABI structures
-export type PaymentRequestBody = {
+export type XRPPaymentRequestBody = {
   transactionId: string;
-  inUtxo: string;
-  utxo: string;
+  proofOwner: string;
 };
 
 export type ReferencedPaymentNonexistenceRequestBody = {
@@ -28,8 +44,16 @@ export type ReferencedPaymentNonexistenceRequestBody = {
   sourceAddressesRoot: string;
 };
 
+export type EVMTransactionRequestBody = {
+  transactionHash: string;
+  requiredConfirmations: string;
+  provideInput: boolean;
+  listEvents: boolean;
+  logIndices: string[];
+};
+
 // Proof data types for each attestation type
-export type PaymentProofData = {
+export type XRPPaymentProofData = {
   response: {
     attestationType: `0x${string}`;
     sourceId: `0x${string}`;
@@ -37,22 +61,23 @@ export type PaymentProofData = {
     lowestUsedTimestamp: string;
     requestBody: {
       transactionId: `0x${string}`;
-      inUtxo: string;
-      utxo: string;
+      proofOwner: `0x${string}`;
     };
     responseBody: {
       blockNumber: string;
       blockTimestamp: string;
+      sourceAddress: string;
       sourceAddressHash: `0x${string}`;
-      sourceAddressesRoot: `0x${string}`;
       receivingAddressHash: `0x${string}`;
       intendedReceivingAddressHash: `0x${string}`;
       spentAmount: string;
       intendedSpentAmount: string;
       receivedAmount: string;
       intendedReceivedAmount: string;
-      standardPaymentReference: `0x${string}`;
-      oneToOne: boolean;
+      hasMemoData: boolean;
+      firstMemoData: `0x${string}`;
+      hasDestinationTag: boolean;
+      destinationTag: string;
       status: number;
     };
   };
@@ -79,6 +104,42 @@ export type ReferencedPaymentNonexistenceProofData = {
       minimalBlockTimestamp: string;
       firstOverflowBlockNumber: string;
       firstOverflowBlockTimestamp: string;
+    };
+  };
+  proof: `0x${string}`[];
+};
+
+export type EVMTransactionEvent = {
+  logIndex: string | number;
+  emitterAddress: `0x${string}`;
+  topics: `0x${string}`[];
+  data: `0x${string}`;
+  removed: boolean;
+};
+
+export type EVMTransactionProofData = {
+  response: {
+    attestationType: `0x${string}`;
+    sourceId: `0x${string}`;
+    votingRound: string;
+    lowestUsedTimestamp: string;
+    requestBody: {
+      transactionHash: `0x${string}`;
+      requiredConfirmations: string | number;
+      provideInput: boolean;
+      listEvents: boolean;
+      logIndices: (string | number)[];
+    };
+    responseBody: {
+      blockNumber: string;
+      timestamp: string;
+      sourceAddress: `0x${string}`;
+      isDeployment: boolean;
+      receivingAddress: `0x${string}`;
+      value: string;
+      input: `0x${string}`;
+      status: number;
+      events: EVMTransactionEvent[];
     };
   };
   proof: `0x${string}`[];
@@ -115,7 +176,10 @@ export const postRequestToDALayer = async (
 
 // Generic function to retrieve data and proof for any attestation type
 export const retrieveDataAndProof = async <
-  T extends PaymentProofData | ReferencedPaymentNonexistenceProofData,
+  T extends
+    | XRPPaymentProofData
+    | ReferencedPaymentNonexistenceProofData
+    | EVMTransactionProofData,
 >(
   url: string,
   abiEncodedRequest: string,
@@ -162,13 +226,13 @@ export const retrieveDataAndProof = async <
 };
 
 // Type-safe wrapper functions for specific attestation types
-export const retrievePaymentDataAndProof = async (
+export const retrieveXRPPaymentDataAndProof = async (
   url: string,
   abiEncodedRequest: string,
   roundId: number,
   apiKey: string
-): Promise<PaymentProofData> => {
-  return retrieveDataAndProof<PaymentProofData>(
+): Promise<XRPPaymentProofData> => {
+  return retrieveDataAndProof<XRPPaymentProofData>(
     url,
     abiEncodedRequest,
     roundId,
@@ -190,9 +254,26 @@ export const retrieveReferencedPaymentNonexistenceDataAndProof = async (
   );
 };
 
+export const retrieveEVMTransactionDataAndProof = async (
+  url: string,
+  abiEncodedRequest: string,
+  roundId: number,
+  apiKey: string
+): Promise<EVMTransactionProofData> => {
+  return retrieveDataAndProof<EVMTransactionProofData>(
+    url,
+    abiEncodedRequest,
+    roundId,
+    apiKey
+  );
+};
+
 // Generic retry wrapper function
 export const retrieveDataAndProofWithRetry = async <
-  T extends PaymentProofData | ReferencedPaymentNonexistenceProofData,
+  T extends
+    | XRPPaymentProofData
+    | ReferencedPaymentNonexistenceProofData
+    | EVMTransactionProofData,
 >(
   url: string,
   abiEncodedRequest: string,
@@ -219,14 +300,14 @@ export const retrieveDataAndProofWithRetry = async <
 };
 
 // Type-safe retry wrapper functions for specific attestation types
-export const retrievePaymentDataAndProofWithRetry = async (
+export const retrieveXRPPaymentDataAndProofWithRetry = async (
   url: string,
   abiEncodedRequest: string,
   roundId: number,
   apiKey: string,
   attempts: number = 10
-): Promise<PaymentProofData> => {
-  return retrieveDataAndProofWithRetry<PaymentProofData>(
+): Promise<XRPPaymentProofData> => {
+  return retrieveDataAndProofWithRetry<XRPPaymentProofData>(
     url,
     abiEncodedRequest,
     roundId,
@@ -252,6 +333,22 @@ export const retrieveReferencedPaymentNonexistenceDataAndProofWithRetry =
     );
   };
 
+export const retrieveEVMTransactionDataAndProofWithRetry = async (
+  url: string,
+  abiEncodedRequest: string,
+  roundId: number,
+  apiKey: string,
+  attempts: number = 10
+): Promise<EVMTransactionProofData> => {
+  return retrieveDataAndProofWithRetry<EVMTransactionProofData>(
+    url,
+    abiEncodedRequest,
+    roundId,
+    apiKey,
+    attempts
+  );
+};
+
 // Calculate round ID from transaction
 export const calculateRoundId = async (
   transaction: { receipt: { blockNumber: bigint } },
@@ -266,17 +363,17 @@ export const calculateRoundId = async (
   const blockTimestamp = BigInt(block.timestamp);
 
   const firsVotingRoundStartTs = BigInt(
-    await publicClient.readContract({
+    await readContract<bigint>({
       address: fdcAddresses.flareSystemsManager as `0x${string}`,
-      abi: iFlareSystemsManagerAbi,
+      abi: iFlareSystemsManagerAbi as Abi,
       functionName: 'firstVotingRoundStartTs',
     })
   );
 
   const votingEpochDurationSeconds = BigInt(
-    await publicClient.readContract({
+    await readContract<bigint>({
       address: fdcAddresses.flareSystemsManager as `0x${string}`,
-      abi: iFlareSystemsManagerAbi,
+      abi: iFlareSystemsManagerAbi as Abi,
       functionName: 'votingEpochDurationSeconds',
     })
   );
@@ -295,9 +392,9 @@ export const calculateRoundId = async (
   console.log('Calculated round id:', roundId, '\n');
 
   const currentVotingEpochId = Number(
-    await publicClient.readContract({
+    await readContract<bigint>({
       address: fdcAddresses.flareSystemsManager as `0x${string}`,
-      abi: iFlareSystemsManagerAbi,
+      abi: iFlareSystemsManagerAbi as Abi,
       functionName: 'getCurrentVotingEpochId',
     })
   );
@@ -315,9 +412,9 @@ export const getFdcRequestFee = async (
     throw new Error('FDC Request Fee Configurations address not loaded');
   }
 
-  return await publicClient.readContract({
+  return await readContract<bigint>({
     address: fdcAddresses.fdcRequestFeeConfigurations as `0x${string}`,
-    abi: iFdcRequestFeeConfigurationsAbi,
+    abi: iFdcRequestFeeConfigurationsAbi as Abi,
     functionName: 'getRequestFee',
     args: [abiEncodedRequest as `0x${string}`],
   });
@@ -331,6 +428,8 @@ export const FDC_CONSTANTS = {
   DA_LAYER_API_URL: `/api/proof-request`,
   URL_TYPE_BASE: 'xrp',
   SOURCE_ID_BASE: 'testXRP',
+  URL_TYPE_ETH: 'eth',
+  SOURCE_ID_ETH: 'testETH',
 } as const;
 
 // Base function to prepare attestation request
@@ -339,7 +438,10 @@ export const prepareAttestationRequestBase = async (
   apiKey: string,
   attestationTypeBase: string,
   sourceIdBase: string,
-  requestBody: PaymentRequestBody | ReferencedPaymentNonexistenceRequestBody
+  requestBody:
+    | XRPPaymentRequestBody
+    | ReferencedPaymentNonexistenceRequestBody
+    | EVMTransactionRequestBody
 ) => {
   console.log('Url:', url, '\n');
   const attestationType = toHex(attestationTypeBase);
@@ -370,25 +472,23 @@ export const prepareAttestationRequestBase = async (
   return await response.json();
 };
 
-// Prepare Payment attestation request
-export const preparePaymentAttestationRequest = async (
+// Prepare XRPPayment attestation request
+export const prepareXRPPaymentAttestationRequest = async (
   transactionId: string,
-  inUtxo: string = '0',
-  utxo: string = '0'
+  proofOwner: string = '0x0000000000000000000000000000000000000000'
 ) => {
-  const requestBody: PaymentRequestBody = {
-    transactionId: transactionId,
-    inUtxo: inUtxo,
-    utxo: utxo,
+  const requestBody: XRPPaymentRequestBody = {
+    transactionId,
+    proofOwner,
   };
 
-  const url = `${FDC_CONSTANTS.VERIFIER_URL_TESTNET}verifier/${FDC_CONSTANTS.URL_TYPE_BASE}/Payment/prepareRequest`;
+  const url = `${FDC_CONSTANTS.VERIFIER_URL_TESTNET}verifier/${FDC_CONSTANTS.URL_TYPE_BASE}/XRPPayment/prepareRequest`;
   const apiKey = FDC_CONSTANTS.VERIFIER_API_KEY_TESTNET ?? '';
 
   return await prepareAttestationRequestBase(
     url,
     apiKey,
-    'Payment',
+    'XRPPayment',
     FDC_CONSTANTS.SOURCE_ID_BASE,
     requestBody
   );
@@ -421,9 +521,39 @@ export const prepareReferencedPaymentNonexistenceAttestationRequest = async (
   );
 };
 
-// Verify Payment using FDC Verification contract
-export const verifyPayment = async (
-  proofData: PaymentProofData,
+// Prepare EVMTransaction attestation request (Sepolia / testETH)
+export const prepareEVMTransactionAttestationRequest = async (
+  transactionHash: string,
+  opts?: {
+    requiredConfirmations?: string;
+    provideInput?: boolean;
+    listEvents?: boolean;
+    logIndices?: string[];
+  }
+) => {
+  const requestBody: EVMTransactionRequestBody = {
+    transactionHash,
+    requiredConfirmations: opts?.requiredConfirmations ?? '1',
+    provideInput: opts?.provideInput ?? true,
+    listEvents: opts?.listEvents ?? true,
+    logIndices: opts?.logIndices ?? [],
+  };
+
+  const url = `${FDC_CONSTANTS.VERIFIER_URL_TESTNET}verifier/${FDC_CONSTANTS.URL_TYPE_ETH}/EVMTransaction/prepareRequest`;
+  const apiKey = FDC_CONSTANTS.VERIFIER_API_KEY_TESTNET ?? '';
+
+  return await prepareAttestationRequestBase(
+    url,
+    apiKey,
+    'EVMTransaction',
+    FDC_CONSTANTS.SOURCE_ID_ETH,
+    requestBody
+  );
+};
+
+// Verify XRPPayment using FDC Verification contract
+export const verifyXRPPayment = async (
+  proofData: XRPPaymentProofData,
   fdcAddresses: { fdcVerification: string }
 ) => {
   if (!fdcAddresses?.fdcVerification) {
@@ -434,15 +564,13 @@ export const verifyPayment = async (
     throw new Error('Proof data is incomplete');
   }
 
-  // Extract data from proof response
   const response = proofData.response;
   const proof = proofData.proof;
 
-  // Call verifyPayment function
-  const result = await publicClient.readContract({
+  const result = await readContract<boolean>({
     address: fdcAddresses.fdcVerification as `0x${string}`,
-    abi: iPaymentVerificationAbi,
-    functionName: 'verifyPayment',
+    abi: ixrpPaymentVerificationAbi as Abi,
+    functionName: 'verifyXRPPayment',
     args: [
       {
         merkleProof: proof,
@@ -453,14 +581,13 @@ export const verifyPayment = async (
           lowestUsedTimestamp: BigInt(response.lowestUsedTimestamp),
           requestBody: {
             transactionId: response.requestBody.transactionId,
-            inUtxo: BigInt(response.requestBody.inUtxo),
-            utxo: BigInt(response.requestBody.utxo),
+            proofOwner: response.requestBody.proofOwner,
           },
           responseBody: {
             blockNumber: BigInt(response.responseBody.blockNumber),
             blockTimestamp: BigInt(response.responseBody.blockTimestamp),
+            sourceAddress: response.responseBody.sourceAddress,
             sourceAddressHash: response.responseBody.sourceAddressHash,
-            sourceAddressesRoot: response.responseBody.sourceAddressesRoot,
             receivingAddressHash: response.responseBody.receivingAddressHash,
             intendedReceivingAddressHash:
               response.responseBody.intendedReceivingAddressHash,
@@ -472,9 +599,10 @@ export const verifyPayment = async (
             intendedReceivedAmount: BigInt(
               response.responseBody.intendedReceivedAmount
             ),
-            standardPaymentReference:
-              response.responseBody.standardPaymentReference,
-            oneToOne: response.responseBody.oneToOne,
+            hasMemoData: response.responseBody.hasMemoData,
+            firstMemoData: response.responseBody.firstMemoData,
+            hasDestinationTag: response.responseBody.hasDestinationTag,
+            destinationTag: BigInt(response.responseBody.destinationTag),
             status: response.responseBody.status,
           },
         },
@@ -482,7 +610,7 @@ export const verifyPayment = async (
     ],
   });
 
-  console.log('Payment verification result:', result);
+  console.log('XRPPayment verification result:', result);
   return result;
 };
 
@@ -504,9 +632,9 @@ export const verifyReferencedPaymentNonexistence = async (
   const proof = proofData.proof;
 
   // Call verifyReferencedPaymentNonexistence function
-  const result = await publicClient.readContract({
+  const result = await readContract<boolean>({
     address: fdcAddresses.fdcVerification as `0x${string}`,
-    abi: iReferencedPaymentNonexistenceVerificationAbi,
+    abi: iReferencedPaymentNonexistenceVerificationAbi as Abi,
     functionName: 'verifyReferencedPaymentNonexistence',
     args: [
       {
@@ -549,6 +677,69 @@ export const verifyReferencedPaymentNonexistence = async (
   return result;
 };
 
+// Verify EVMTransaction using FDC Verification contract
+export const verifyEVMTransaction = async (
+  proofData: EVMTransactionProofData,
+  fdcAddresses: { fdcVerification: string }
+) => {
+  if (!fdcAddresses?.fdcVerification) {
+    throw new Error('FDC Verification address not loaded');
+  }
+
+  if (!proofData.response || !proofData.proof) {
+    throw new Error('Proof data is incomplete');
+  }
+
+  const response = proofData.response;
+  const proof = proofData.proof;
+
+  const result = await readContract<boolean>({
+    address: fdcAddresses.fdcVerification as `0x${string}`,
+    abi: ievmTransactionVerificationAbi as Abi,
+    functionName: 'verifyEVMTransaction',
+    args: [
+      {
+        merkleProof: proof,
+        data: {
+          attestationType: response.attestationType,
+          sourceId: response.sourceId,
+          votingRound: BigInt(response.votingRound),
+          lowestUsedTimestamp: BigInt(response.lowestUsedTimestamp),
+          requestBody: {
+            transactionHash: response.requestBody.transactionHash,
+            requiredConfirmations: Number(
+              response.requestBody.requiredConfirmations
+            ),
+            provideInput: response.requestBody.provideInput,
+            listEvents: response.requestBody.listEvents,
+            logIndices: response.requestBody.logIndices.map(i => Number(i)),
+          },
+          responseBody: {
+            blockNumber: BigInt(response.responseBody.blockNumber),
+            timestamp: BigInt(response.responseBody.timestamp),
+            sourceAddress: response.responseBody.sourceAddress,
+            isDeployment: response.responseBody.isDeployment,
+            receivingAddress: response.responseBody.receivingAddress,
+            value: BigInt(response.responseBody.value),
+            input: response.responseBody.input,
+            status: response.responseBody.status,
+            events: (response.responseBody.events ?? []).map(event => ({
+              logIndex: Number(event.logIndex),
+              emitterAddress: event.emitterAddress,
+              topics: event.topics,
+              data: event.data,
+              removed: event.removed,
+            })),
+          },
+        },
+      },
+    ],
+  });
+
+  console.log('EVMTransaction verification result:', result);
+  return result;
+};
+
 // Submit attestation request to FDC Hub
 export const submitAttestationRequest = async (
   abiEncodedRequest: string,
@@ -569,6 +760,7 @@ export const submitAttestationRequest = async (
   // Submit the attestation request
   requestAttestation({
     address: fdcAddresses.fdcHub as `0x${string}`,
+    functionName: 'requestAttestation',
     args: [abiEncodedRequest as `0x${string}`],
     value: requestFee,
   });

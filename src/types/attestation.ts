@@ -1,5 +1,5 @@
 /**
- * Types and interfaces for XRP Payment Attestation
+ * Types and interfaces for XRPPayment attestation
  */
 
 export interface AttestationData {
@@ -14,11 +14,15 @@ export interface ProofData {
 
 export interface DecodedResponse {
   transactionId: string;
-  inUtxo: string;
-  utxo: string;
+  proofOwner: string;
   amount: string;
   sourceAddress: string;
-  receivingAddress: string;
+  receivingAddressHash: string;
+  hasMemoData: boolean;
+  firstMemoData: string;
+  hasDestinationTag: boolean;
+  destinationTag: string;
   blockNumber: number;
-  timestamp: number;
+  blockTimestamp: number;
+  status: number;
 }
