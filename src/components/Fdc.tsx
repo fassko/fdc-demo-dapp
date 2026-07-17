@@ -1860,7 +1860,7 @@ export default function Fdc() {
                                     </code>{' '}
                                     is a hex string that encodes all the request
                                     data in a format the FDC contract can
-                                    understand. Here's how it's structured:
+                                    understand. Here is how it is structured:
                                   </p>
 
                                   <div className='bg-white p-3 rounded border text-xs font-mono'>
@@ -1939,7 +1939,7 @@ export default function Fdc() {
                                     </p>
                                     <p>
                                       <strong>Integrity:</strong> The MIC
-                                      ensures the attestation data hasn't been
+                                      ensures the attestation data has not been
                                       tampered with
                                     </p>
                                   </div>
