@@ -105,16 +105,18 @@ export const decodeEvmTransactionEvent = (
 
   for (const abiEvent of KNOWN_EVENT_ABIS) {
     try {
+      // Union of known ABIs prevents viem from inferring DecodeEventLogReturnType;
+      // we only need eventName + args and map them manually below.
       const decoded = decodeEventLog({
         abi: [abiEvent],
         data: (event.data || '0x') as Hex,
         topics,
         strict: true,
-      });
+      }) as { eventName: string; args?: Record<string, unknown> };
 
       if (decoded.eventName !== abiEvent.name) continue;
 
-      const argsObj = (decoded.args ?? {}) as Record<string, unknown>;
+      const argsObj = decoded.args ?? {};
       const args: DecodedEvmEventArg[] = abiEvent.inputs.map(input => {
         const raw = argsObj[input.name];
         return {
