@@ -1,9 +1,4 @@
-import {
-  decodeEventLog,
-  type AbiEvent,
-  type Hex,
-  type LogTopic,
-} from 'viem';
+import { decodeEventLog, type AbiEvent, type Hex } from 'viem';
 
 import type { EVMTransactionEvent } from '@/lib/fdcUtils';
 
@@ -105,10 +100,8 @@ export const decodeEvmTransactionEvent = (
 ): DecodedEvmEvent | null => {
   if (!event.topics?.length) return null;
 
-  const topics = event.topics.map(t => t as Hex) as [
-    Hex,
-    ...LogTopic[],
-  ];
+  // decodeEventLog expects [signature, ...indexedArgs] as Hex tuples
+  const topics = event.topics as [Hex, ...Hex[]];
 
   for (const abiEvent of KNOWN_EVENT_ABIS) {
     try {
