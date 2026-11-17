@@ -26,6 +26,14 @@ export default function Home() {
           >
             @FlareDevHub
           </a>
+          <a
+            href='https://github.com/fassko/fdc-demo-dapp'
+            target='_blank'
+            rel='noopener noreferrer'
+            className='hover:text-[#E62058] hover:underline'
+          >
+            GitHub
+          </a>
         </div>
       </footer>
     </div>

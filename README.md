@@ -39,7 +39,7 @@ The [Flare Data Connector (FDC)](https://dev.flare.network/fdc/overview) is a de
 1. Clone the repository:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/fassko/fdc-demo-dapp.git
 cd fdc-demo-dapp
 ```
 
