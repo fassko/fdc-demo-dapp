@@ -26,19 +26,23 @@ import {
 } from 'wagmi';
 import { flareTestnet } from 'wagmi/chains';
 
+import {
+  EvmAttestationSummary,
+  type EvmAttestationView,
+} from '@/components/EvmAttestationSummary';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { WorkflowProgress } from '@/components/WorkflowProgress';
 import {
   iFdcRequestFeeConfigurationsAbi,
   useWriteIFdcHub,
 } from '@flarenetwork/flare-wagmi-periphery-package/contracts/coston2';
 import { useFdcContracts } from '@/hooks/useFdcContracts';
 import { copyToClipboardWithTimeout } from '@/lib/clipboard';
-import { decodeEvmTransactionEvent } from '@/lib/decodeEvmEvent';
 import {
   calculateRoundId,
   FDC_CONSTANTS,
@@ -46,7 +50,6 @@ import {
   prepareXRPPaymentAttestationRequest,
   retrieveEVMTransactionDataAndProofWithRetry,
   retrieveXRPPaymentDataAndProofWithRetry,
-  type EVMTransactionEvent,
   type EVMTransactionProofData,
   type XRPPaymentProofData,
   verifyEVMTransaction,
@@ -62,91 +65,30 @@ const SEPOLIA_TX_HASH =
   '0x8cc5c3614eb9fd0f82d44f841a520962d93ee053f012fa1639c91d40c1123f16';
 const SAMPLE_XRPL_TX =
   'A6589F33CA3B679CF3E833632E81E5A075CED6057316782A2B466FF64D05CBF0';
-const DEFAULT_REQUIRED_CONFIRMATIONS = '1';
-const MAX_LOG_INDICES = 50;
-const UINT32_MAX = 4_294_967_295;
 
-const parseLogIndicesInput = (raw: string | undefined): string[] => {
-  const trimmed = (raw ?? '').trim();
-  if (!trimmed) return [];
-  return trimmed.split(/[\s,]+/).filter(Boolean);
-};
-
-const truncateHex = (value: string, head = 10, tail = 8) => {
-  if (value.length <= head + tail + 3) return value;
-  return `${value.slice(0, head)}...${value.slice(-tail)}`;
-};
+/** Fixed demo request params — keeps the configure UI to a single tx hash field. */
+const EVM_DEMO_REQUEST = {
+  requiredConfirmations: '1',
+  provideInput: true,
+  listEvents: true,
+  logIndices: [] as string[],
+} as const;
 
 const createFdcFormSchema = (attestationType: AttestationType) =>
-  z
-    .object({
-      transactionId: z
-        .string()
-        .min(1, 'Transaction ID is required')
-        .refine(
-          val =>
-            attestationType === 'XRPPayment'
-              ? /^[A-F0-9]{64}$/i.test(val.trim())
-              : /^0x[A-F0-9]{64}$/i.test(val.trim()),
+  z.object({
+    transactionId: z
+      .string()
+      .min(1, 'Transaction ID is required')
+      .refine(
+        val =>
           attestationType === 'XRPPayment'
-            ? 'Transaction ID must be a valid 64-character hexadecimal XRPL transaction ID'
-            : 'Transaction hash must be a valid 0x-prefixed 64-character hexadecimal string'
-        ),
-      requiredConfirmations: z
-        .string()
-        .optional()
-        .refine(
-          val =>
-            attestationType !== 'EVMTransaction' ||
-            (val !== undefined &&
-              val.trim() !== '' &&
-              /^\d+$/.test(val.trim()) &&
-              Number(val.trim()) >= 1 &&
-              Number(val.trim()) <= 65535),
-          'Required confirmations must be an integer between 1 and 65535'
-        ),
-      provideInput: z.boolean(),
-      listEvents: z.boolean(),
-      logIndices: z.string().optional(),
-    })
-    .superRefine((data, ctx) => {
-      if (attestationType !== 'EVMTransaction' || !data.listEvents) return;
-
-      const indices = parseLogIndicesInput(data.logIndices);
-      if (indices.length > MAX_LOG_INDICES) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['logIndices'],
-          message: `At most ${MAX_LOG_INDICES} log indices are allowed`,
-        });
-        return;
-      }
-
-      const numbers: number[] = [];
-      for (const index of indices) {
-        if (!/^\d+$/.test(index) || Number(index) > UINT32_MAX) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['logIndices'],
-            message:
-              'Log indices must be comma-separated integers between 0 and 4294967295',
-          });
-          return;
-        }
-        numbers.push(Number(index));
-      }
-
-      for (let i = 1; i < numbers.length; i++) {
-        if (numbers[i] <= numbers[i - 1]) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ['logIndices'],
-            message: 'Log indices must be strictly increasing',
-          });
-          return;
-        }
-      }
-    });
+            ? /^[A-F0-9]{64}$/i.test(val.trim())
+            : /^0x[A-F0-9]{64}$/i.test(val.trim()),
+        attestationType === 'XRPPayment'
+          ? 'Transaction ID must be a valid 64-character hexadecimal XRPL transaction ID'
+          : 'Transaction hash must be a valid 0x-prefixed 64-character hexadecimal string'
+      ),
+  });
 
 type FdcFormData = z.infer<ReturnType<typeof createFdcFormSchema>>;
 
@@ -157,6 +99,8 @@ interface FdcDocLink {
 
 interface FdcStep {
   id: string;
+  /** Short label for the progress rail */
+  label: string;
   title: string;
   description: string | React.ReactNode;
   status: 'pending' | 'in_progress' | 'completed' | 'error';
@@ -224,14 +168,9 @@ const getInitialSteps = (
   return [
     {
       id: 'prepare-request',
-      title: '1. Prepare request (verifier)',
-      description: (
-        <>
-          Call the verifier{' '}
-          <code className='text-xs bg-gray-100 px-1 rounded'>prepareRequest</code>{' '}
-          API to get an ABI-encoded attestation request
-        </>
-      ),
+      label: 'Prepare',
+      title: 'Prepare request',
+      description: 'Ask the verifier for an ABI-encoded attestation request',
       status: 'pending',
       details: {
         whatHappens: isEvm
@@ -302,16 +241,9 @@ const getInitialSteps = (
     },
     {
       id: 'submit-request',
-      title: '2. Submit to FdcHub',
-      description: (
-        <>
-          Call{' '}
-          <DocLink href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'>
-            FdcHub.requestAttestation
-          </DocLink>{' '}
-          with the encoded request and fee
-        </>
-      ),
+      label: 'Submit',
+      title: 'Submit to FdcHub',
+      description: 'Send requestAttestation on Coston2 with the required fee',
       status: 'pending',
       details: {
         whatHappens:
@@ -343,16 +275,9 @@ const getInitialSteps = (
     },
     {
       id: 'wait-finalization',
-      title: '3. Wait for round finalization',
-      description: (
-        <>
-          Poll{' '}
-          <DocLink href='https://dev.flare.network/network/fsp/solidity-reference/IRelay#isfinalized'>
-            Relay.isFinalized(200, roundId)
-          </DocLink>{' '}
-          until the voting round closes (~90s)
-        </>
-      ),
+      label: 'Finalize',
+      title: 'Wait for finalization',
+      description: 'Providers vote; wait ~90s until the voting round closes',
       status: 'pending',
       details: {
         whatHappens:
@@ -381,16 +306,9 @@ const getInitialSteps = (
     },
     {
       id: 'prepare-proof',
-      title: '4. Fetch proof (DA Layer)',
-      description: (
-        <>
-          POST{' '}
-          <code className='text-xs bg-gray-100 px-1 rounded'>
-            proof-by-request-round
-          </code>{' '}
-          with votingRoundId + requestBytes
-        </>
-      ),
+      label: 'Proof',
+      title: 'Fetch proof',
+      description: 'Pull the attestation and Merkle proof from the DA Layer',
       status: 'pending',
       details: {
         whatHappens:
@@ -431,16 +349,9 @@ const getInitialSteps = (
     },
     {
       id: 'verify-data',
-      title: '5. Verify proof onchain',
-      description: (
-        <>
-          Call{' '}
-          <DocLink href={verifyHref}>
-            FdcVerification.{verifyMethod}
-          </DocLink>{' '}
-          then use the attested data in your contract
-        </>
-      ),
+      label: 'Verify',
+      title: 'Verify onchain',
+      description: `Confirm the proof with FdcVerification.${verifyMethod}`,
       status: 'pending',
       details: {
         whatHappens: isEvm
@@ -498,19 +409,13 @@ export default function Fdc() {
     handleSubmit,
     reset,
     setValue,
-    watch,
     formState: { errors },
   } = useForm<FdcFormData>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       transactionId: SEPOLIA_TX_HASH,
-      requiredConfirmations: DEFAULT_REQUIRED_CONFIRMATIONS,
-      provideInput: true,
-      listEvents: true,
-      logIndices: '',
     },
   });
-  const listEventsEnabled = watch('listEvents');
 
   const fieldInputClass = (hasError?: boolean) =>
     `h-10 border-gray-300 font-mono text-sm focus:ring-2 focus:ring-opacity-50 ${
@@ -523,9 +428,6 @@ export default function Fdc() {
     }) as React.CSSProperties;
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [mainTab, setMainTab] = useState<'configure' | 'workflow' | 'guide'>(
-    'configure'
-  );
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
@@ -858,6 +760,7 @@ export default function Fdc() {
         }
 
         setCurrentAttestationStep('');
+        setExpandedSteps(new Set(['verify-data']));
         setSuccess(
           'FDC workflow completed successfully! All steps have been executed.'
         );
@@ -928,12 +831,9 @@ export default function Fdc() {
     reset({
       transactionId:
         attestationType === 'EVMTransaction' ? SEPOLIA_TX_HASH : SAMPLE_XRPL_TX,
-      requiredConfirmations: DEFAULT_REQUIRED_CONFIRMATIONS,
-      provideInput: true,
-      listEvents: true,
-      logIndices: '',
     });
     setSteps(getInitialSteps(attestationType, address ?? ZERO_ADDRESS));
+    setExpandedSteps(new Set());
     setError(null);
     setSuccess(null);
     setCurrentAttestationData(null);
@@ -941,24 +841,17 @@ export default function Fdc() {
     setVerificationResult(null);
   }, [attestationType, address, reset]);
 
-  const prepareRequest = async (
-    transactionId: string,
-    evmRequest: {
-      requiredConfirmations?: string;
-      provideInput?: boolean;
-      listEvents?: boolean;
-      logIndices?: string[];
-    } = {}
-  ) => {
+  const prepareRequest = async (transactionId: string) => {
     try {
       updateStepStatus('prepare-request', 'in_progress');
 
       if (attestationType === 'EVMTransaction') {
-        const requiredConfirmations =
-          evmRequest.requiredConfirmations ?? DEFAULT_REQUIRED_CONFIRMATIONS;
-        const provideInput = evmRequest.provideInput ?? true;
-        const listEvents = evmRequest.listEvents ?? true;
-        const logIndices = evmRequest.logIndices ?? [];
+        const {
+          requiredConfirmations,
+          provideInput,
+          listEvents,
+          logIndices,
+        } = EVM_DEMO_REQUEST;
         const requestBody = {
           attestationType:
             '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
@@ -1044,11 +937,6 @@ export default function Fdc() {
 
   const executeFdcWorkflow = async (data: FdcFormData) => {
     const transactionId = data.transactionId.trim();
-    const requiredConfirmations =
-      data.requiredConfirmations?.trim() || DEFAULT_REQUIRED_CONFIRMATIONS;
-    const provideInput = data.provideInput;
-    const listEvents = data.listEvents;
-    const logIndices = listEvents ? parseLogIndicesInput(data.logIndices) : [];
 
     if (!fdcAddresses) {
       setError('FDC contract addresses not loaded. Please wait and try again.');
@@ -1068,23 +956,18 @@ export default function Fdc() {
     }
 
     setIsLoading(true);
-    setMainTab('workflow');
     setError(null);
     setSuccess(null);
 
     // Reset all steps to pending
+    setExpandedSteps(new Set());
     setSteps(prev =>
       prev.map(step => ({ ...step, status: 'pending' as const }))
     );
 
     try {
       // Step 1: Prepare Request
-      const attestationResponse = await prepareRequest(transactionId, {
-        requiredConfirmations,
-        provideInput,
-        listEvents,
-        logIndices,
-      });
+      const attestationResponse = await prepareRequest(transactionId);
 
       console.log('=== executeFdcWorkflow after prepareRequest ===');
       console.log('attestationResponse:', attestationResponse);
@@ -1117,50 +1000,23 @@ export default function Fdc() {
     }
   };
 
-  const getStepIcon = (status: FdcStep['status']) => {
-    switch (status) {
-      case 'completed':
-        return <CheckCircle className='h-5 w-5 text-green-600' />;
-      case 'in_progress':
-        return (
-          <Loader2
-            className='h-5 w-5 animate-spin'
-            style={{ color: '#E62058' }}
-          />
-        );
-      case 'error':
-        return <XCircle className='h-5 w-5 text-red-600' />;
-      default:
-        return (
-          <div className='h-5 w-5 rounded-full border-2 border-gray-300' />
-        );
-    }
-  };
-
-  const getStepStatusColor = (status: FdcStep['status']) => {
-    switch (status) {
-      case 'completed':
-        return 'bg-green-50 border-green-200';
-      case 'in_progress':
-        return 'border-2';
-      case 'error':
-        return 'bg-red-50 border-red-200';
-      default:
-        return 'bg-gray-50 border-gray-200';
-    }
-  };
-
   const toggleStepExpansion = (stepId: string) => {
     setExpandedSteps(prev => {
-      const newSet = new Set(prev);
-      if (newSet.has(stepId)) {
-        newSet.delete(stepId);
-      } else {
-        newSet.add(stepId);
-      }
-      return newSet;
+      const next = new Set(prev);
+      if (next.has(stepId)) next.delete(stepId);
+      else next.add(stepId);
+      return next;
     });
   };
+
+  const isStepExpanded = (step: FdcStep) =>
+    expandedSteps.has(step.id) ||
+    step.status === 'in_progress' ||
+    step.status === 'error';
+
+  const workflowStarted = steps.some(s => s.status !== 'pending');
+  const workflowComplete =
+    steps.length > 0 && steps.every(s => s.status === 'completed');
 
   // Custom submitAttestationRequest function with fallback publicClient
   const submitAttestationRequestWithWagmi = async (
@@ -1265,582 +1121,427 @@ export default function Fdc() {
   );
 
   return (
-    <div className='w-full max-w-6xl mx-auto p-6'>
-      <Card>
+    <div className='mx-auto w-full max-w-5xl'>
+      <Card className='border-gray-200/80 shadow-sm'>
         <CardHeader className='space-y-4'>
           <div>
-            <CardTitle
-              className='flex items-center gap-2'
-              style={{ color: '#E62058' }}
-            >
-              <CheckCircle className='h-5 w-5' style={{ color: '#E62058' }} />
-              <a
-                href='https://dev.flare.network/fdc/overview'
-                target='_blank'
-                rel='noopener noreferrer'
-                className='underline inline-flex items-center gap-1'
-                style={{ color: '#E62058' }}
-              >
-                Flare Data Connector (FDC)
-                <ExternalLink className='h-4 w-4' />
-              </a>
-              Workflow
+            <CardTitle className='text-2xl text-[#E62058] sm:text-3xl'>
+              Flare Data Connector
             </CardTitle>
-            <p className='mt-2 text-sm text-gray-600'>
-              End-to-end FDC pipeline on Coston2: prepare → submit → finalize →
-              fetch proof → verify. Follows{' '}
+            <p className='mt-1 text-base text-gray-800'>
+              Live attestation workflow on Coston2
+            </p>
+            <p className='mt-2 max-w-2xl text-sm text-gray-600'>
+              Prepare → submit → finalize → proof → verify. Docs:{' '}
               <DocLink href='https://dev.flare.network/fdc/getting-started'>
                 Getting started
-              </DocLink>{' '}
-              and the{' '}
+              </DocLink>
+              {' · '}
               <DocLink href='https://dev.flare.network/fdc/guides/fdc-by-hand/'>
                 FDC by hand
-              </DocLink>{' '}
-              guide.
+              </DocLink>
             </p>
           </div>
           {walletBar}
         </CardHeader>
-        <CardContent>
-          <Tabs
-            value={mainTab}
-            onValueChange={value =>
-              setMainTab(value as 'configure' | 'workflow' | 'guide')
-            }
-            className='gap-6'
+        <CardContent className='space-y-8'>
+          <form
+            onSubmit={handleSubmit(executeFdcWorkflow)}
+            className='space-y-4'
           >
-            <TabsList className='grid h-11 w-full grid-cols-3 bg-[#fef7f0] p-1'>
-              <TabsTrigger
-                value='configure'
-                className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
+            <div className='space-y-2'>
+              <Label className='text-gray-900'>Attestation</Label>
+              <Tabs
+                value={attestationType}
+                onValueChange={value =>
+                  setAttestationType(value as AttestationType)
+                }
               >
-                Configure
-              </TabsTrigger>
-              <TabsTrigger
-                value='workflow'
-                className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
-              >
-                Workflow
-              </TabsTrigger>
-              <TabsTrigger
-                value='guide'
-                className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
-              >
-                Guide
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent value='configure' className='space-y-6'>
-              <form
-                onSubmit={handleSubmit(executeFdcWorkflow)}
-                className='space-y-6'
-              >
-                <div className='space-y-3'>
-                  <Label style={{ color: '#E62058' }}>Attestation Type</Label>
-                  <Tabs
-                    value={attestationType}
-                    onValueChange={value =>
-                      setAttestationType(value as AttestationType)
-                    }
+                <TabsList className='grid h-11 w-full max-w-md grid-cols-2 bg-gray-100 p-1'>
+                  <TabsTrigger
+                    value='EVMTransaction'
+                    disabled={isLoading}
+                    className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
                   >
-                    <TabsList className='grid h-11 w-full max-w-md grid-cols-2 bg-gray-100 p-1'>
-                      <TabsTrigger
-                        value='EVMTransaction'
-                        disabled={isLoading}
-                        className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
-                      >
-                        EVMTransaction
-                      </TabsTrigger>
-                      <TabsTrigger
-                        value='XRPPayment'
-                        disabled={isLoading}
-                        className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
-                      >
-                        XRPPayment
-                      </TabsTrigger>
-                    </TabsList>
-                  </Tabs>
-                  <p className='text-xs text-gray-600 flex flex-wrap items-center gap-x-3 gap-y-1'>
-                    {attestationType === 'EVMTransaction' ? (
-                      <>
-                        <span>Source: testETH (Sepolia)</span>
-                        <DocLink href='https://dev.flare.network/fdc/attestation-types/evm-transaction'>
-                          Spec
-                        </DocLink>
-                        <DocLink href='https://dev.flare.network/fdc/guides/hardhat/evm-transaction'>
-                          Hardhat guide
-                        </DocLink>
-                        <DocLink href='https://fdc-verifiers-testnet.flare.network/verifier/eth/api-doc'>
-                          Verifier Swagger
-                        </DocLink>
-                      </>
-                    ) : (
-                      <>
-                        <span>Source: testXRP (XRPL testnet)</span>
-                        <DocLink href='https://dev.flare.network/fdc/attestation-types/xrp-payment'>
-                          Spec
-                        </DocLink>
-                        <DocLink href='https://fdc-verifiers-testnet.flare.network/verifier/xrp/api-doc'>
-                          Verifier Swagger
-                        </DocLink>
-                      </>
-                    )}
-                  </p>
-                </div>
-
-                <div className='space-y-2'>
-                  <div className='flex flex-wrap items-end justify-between gap-2'>
-                    <Label htmlFor='transactionId' style={{ color: '#E62058' }}>
-                      {attestationType === 'EVMTransaction'
-                        ? 'Transaction Hash'
-                        : 'Transaction ID'}
-                    </Label>
-                    <div className='flex items-center gap-3 text-xs'>
-                      <button
-                        type='button'
-                        className='cursor-pointer underline'
-                        style={{ color: '#E62058' }}
-                        onClick={() =>
-                          setValue(
-                            'transactionId',
-                            attestationType === 'EVMTransaction'
-                              ? SEPOLIA_TX_HASH
-                              : SAMPLE_XRPL_TX,
-                            { shouldValidate: true }
-                          )
-                        }
-                      >
-                        Use sample
-                      </button>
-                      <a
-                        href={
-                          attestationType === 'EVMTransaction'
-                            ? `https://sepolia.etherscan.io/tx/${SEPOLIA_TX_HASH}`
-                            : `https://livenet.xrpl.org/transactions/${SAMPLE_XRPL_TX}`
-                        }
-                        target='_blank'
-                        rel='noopener noreferrer'
-                        className='inline-flex items-center gap-1 underline'
-                        style={{ color: '#E62058' }}
-                      >
-                        View on explorer
-                        <ExternalLink className='h-3 w-3' />
-                      </a>
-                    </div>
-                  </div>
-                  <Input
-                    {...register('transactionId')}
-                    id='transactionId'
-                    spellCheck={false}
-                    autoComplete='off'
-                    placeholder={
-                      attestationType === 'EVMTransaction'
-                        ? SEPOLIA_TX_HASH
-                        : SAMPLE_XRPL_TX
-                    }
-                    className={fieldInputClass(Boolean(errors.transactionId))}
-                    style={fieldInputStyle(Boolean(errors.transactionId))}
-                  />
-                  {errors.transactionId ? (
-                    <p className='text-sm text-red-600'>
-                      {errors.transactionId.message}
-                    </p>
-                  ) : (
-                    <p className='text-xs text-gray-600'>
-                      {attestationType === 'EVMTransaction'
-                        ? 'Sepolia (testETH) transaction hash. Sample is a LayerZero message.'
-                        : 'XRPL testnet payment transaction ID.'}
-                    </p>
-                  )}
-                </div>
-
-                {attestationType === 'EVMTransaction' && (
-                  <div className='space-y-5'>
-                    <div className='grid gap-4 sm:grid-cols-2'>
-                      <div className='space-y-2'>
-                        <Label
-                          htmlFor='requiredConfirmations'
-                          style={{ color: '#E62058' }}
-                        >
-                          Required Confirmations
-                        </Label>
-                        <Input
-                          {...register('requiredConfirmations')}
-                          id='requiredConfirmations'
-                          type='number'
-                          min={1}
-                          max={65535}
-                          placeholder={DEFAULT_REQUIRED_CONFIRMATIONS}
-                          className={fieldInputClass(
-                            Boolean(errors.requiredConfirmations)
-                          )}
-                          style={fieldInputStyle(
-                            Boolean(errors.requiredConfirmations)
-                          )}
-                        />
-                        {errors.requiredConfirmations ? (
-                          <p className='text-sm text-red-600'>
-                            {errors.requiredConfirmations.message}
-                          </p>
-                        ) : (
-                          <p className='text-xs text-gray-600'>
-                            Tip block counts as 1 confirmation.
-                          </p>
-                        )}
-                      </div>
-
-                      <div className='space-y-2'>
-                        <Label
-                          htmlFor='logIndices'
-                          style={{ color: '#E62058' }}
-                        >
-                          Event Indices
-                        </Label>
-                        <Input
-                          {...register('logIndices')}
-                          id='logIndices'
-                          placeholder='e.g. 0, 2, 5'
-                          disabled={!listEventsEnabled}
-                          className={`${fieldInputClass(Boolean(errors.logIndices))} disabled:cursor-not-allowed disabled:opacity-50`}
-                          style={fieldInputStyle(Boolean(errors.logIndices))}
-                        />
-                        {errors.logIndices ? (
-                          <p className='text-sm text-red-600'>
-                            {errors.logIndices.message}
-                          </p>
-                        ) : (
-                          <p className='text-xs text-gray-600'>
-                            {listEventsEnabled
-                              ? 'Leave empty for all events (max 50). Indices must increase.'
-                              : 'Available when event logs are included.'}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className='grid gap-4 sm:grid-cols-2'>
-                      <label
-                        htmlFor='provideInput'
-                        className='flex cursor-pointer items-start gap-3'
-                      >
-                        <input
-                          {...register('provideInput')}
-                          id='provideInput'
-                          type='checkbox'
-                          className='mt-1 h-4 w-4 shrink-0 cursor-pointer accent-[#E62058]'
-                        />
-                        <span className='space-y-1'>
-                          <span
-                            className='block text-sm font-medium'
-                            style={{ color: '#E62058' }}
-                          >
-                            Include Transaction Input
-                          </span>
-                          <span className='block text-xs text-gray-600'>
-                            Return calldata in the attestation. Off returns
-                            0x00.
-                          </span>
-                        </span>
-                      </label>
-
-                      <label
-                        htmlFor='listEvents'
-                        className='flex cursor-pointer items-start gap-3'
-                      >
-                        <input
-                          {...register('listEvents')}
-                          id='listEvents'
-                          type='checkbox'
-                          className='mt-1 h-4 w-4 shrink-0 cursor-pointer accent-[#E62058]'
-                        />
-                        <span className='space-y-1'>
-                          <span
-                            className='block text-sm font-medium'
-                            style={{ color: '#E62058' }}
-                          >
-                            Include Event Logs
-                          </span>
-                          <span className='block text-xs text-gray-600'>
-                            Return event logs in the attestation.
-                          </span>
-                        </span>
-                      </label>
-                    </div>
-                  </div>
-                )}
-
-                {isLoadingAddresses && (
-                  <Alert
-                    className='border'
-                    style={{
-                      backgroundColor: '#fef7f0',
-                      borderColor: '#E62058',
-                      color: '#E62058',
-                    }}
+                    EVM (Sepolia)
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value='XRPPayment'
+                    disabled={isLoading}
+                    className='data-[state=active]:bg-[#E62058] data-[state=active]:text-white data-[state=active]:shadow-none'
                   >
-                    <AlertDescription>
-                      <div className='flex items-center gap-2'>
-                        <Loader2 className='h-4 w-4 animate-spin' />
-                        Loading FDC contract addresses...
-                      </div>
-                    </AlertDescription>
-                  </Alert>
-                )}
+                    XRP Payment
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
 
-                {addressError && (
-                  <Alert variant='destructive'>
-                    <XCircle className='h-4 w-4' />
-                    <AlertDescription>
-                      Error loading contract addresses: {addressError}
-                    </AlertDescription>
-                  </Alert>
-                )}
-
-                {(error || connectError) && (
-                  <Alert variant='destructive'>
-                    <XCircle className='h-4 w-4' />
-                    <AlertDescription>
-                      {error || connectError?.message}
-                    </AlertDescription>
-                  </Alert>
-                )}
-
-                {!isConnected ? (
-                  <Button
+            <div className='space-y-2'>
+              <div className='flex flex-wrap items-end justify-between gap-2'>
+                <Label htmlFor='transactionId' className='text-gray-900'>
+                  {attestationType === 'EVMTransaction'
+                    ? 'Transaction hash'
+                    : 'Transaction ID'}
+                </Label>
+                <div className='flex items-center gap-3 text-xs'>
+                  <button
                     type='button'
-                    onClick={handleConnect}
-                    disabled={isPending || !isHydrated}
-                    className='w-full'
-                    style={{ backgroundColor: '#E62058' }}
+                    className='cursor-pointer text-[#E62058] underline'
+                    onClick={() =>
+                      setValue(
+                        'transactionId',
+                        attestationType === 'EVMTransaction'
+                          ? SEPOLIA_TX_HASH
+                          : SAMPLE_XRPL_TX,
+                        { shouldValidate: true }
+                      )
+                    }
                   >
-                    {isPending || !isHydrated ? (
-                      <>
-                        <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                        {isPending ? 'Connecting...' : 'Loading...'}
-                      </>
-                    ) : (
-                      <>
-                        <CheckCircle className='mr-2 h-4 w-4' />
-                        Connect MetaMask
-                      </>
-                    )}
-                  </Button>
-                ) : (
-                  <Button
-                    type='submit'
-                    disabled={isLoading || isLoadingAddresses || !!addressError}
-                    className='w-full cursor-pointer disabled:bg-gray-400'
-                    style={{ backgroundColor: '#E62058' }}
+                    Use sample
+                  </button>
+                  <a
+                    href={
+                      attestationType === 'EVMTransaction'
+                        ? `https://sepolia.etherscan.io/tx/${SEPOLIA_TX_HASH}`
+                        : `https://livenet.xrpl.org/transactions/${SAMPLE_XRPL_TX}`
+                    }
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className='inline-flex items-center gap-1 text-[#E62058] underline'
                   >
-                    {isLoading ? (
-                      <>
-                        <Loader2 className='mr-2 h-4 w-4 animate-spin' />
-                        Executing FDC Workflow...
-                      </>
-                    ) : (
-                      <>
-                        <CheckCircle className='mr-2 h-4 w-4' />
-                        Execute FDC Workflow
-                      </>
-                    )}
-                  </Button>
-                )}
+                    Explorer
+                    <ExternalLink className='h-3 w-3' />
+                  </a>
+                </div>
+              </div>
+              <Input
+                {...register('transactionId')}
+                id='transactionId'
+                spellCheck={false}
+                autoComplete='off'
+                disabled={isLoading}
+                placeholder={
+                  attestationType === 'EVMTransaction'
+                    ? SEPOLIA_TX_HASH
+                    : SAMPLE_XRPL_TX
+                }
+                className={fieldInputClass(Boolean(errors.transactionId))}
+                style={fieldInputStyle(Boolean(errors.transactionId))}
+              />
+              {errors.transactionId ? (
+                <p className='text-sm text-red-600'>
+                  {errors.transactionId.message}
+                </p>
+              ) : (
+                <p className='text-xs text-gray-500'>
+                  {attestationType === 'EVMTransaction'
+                    ? 'Sepolia sample is a LayerZero OFT send.'
+                    : 'XRPL testnet payment.'}
+                </p>
+              )}
+            </div>
 
+            {isLoadingAddresses && (
+              <Alert className='border border-[#E62058] bg-[#fef7f0] text-[#E62058]'>
+                <AlertDescription className='flex items-center gap-2'>
+                  <Loader2 className='h-4 w-4 animate-spin' />
+                  Loading FDC contracts…
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {addressError && (
+              <Alert variant='destructive'>
+                <XCircle className='h-4 w-4' />
+                <AlertDescription>
+                  Error loading contract addresses: {addressError}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {(error || connectError) && (
+              <Alert variant='destructive'>
+                <XCircle className='h-4 w-4' />
+                <AlertDescription>
+                  {error || connectError?.message}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {!isConnected ? (
+              <Button
+                type='button'
+                onClick={handleConnect}
+                disabled={isPending || !isHydrated}
+                className='w-full sm:w-auto'
+                style={{ backgroundColor: '#E62058' }}
+              >
+                {isPending || !isHydrated ? (
+                  <>
+                    <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                    {isPending ? 'Connecting…' : 'Loading…'}
+                  </>
+                ) : (
+                  'Connect MetaMask'
+                )}
+              </Button>
+            ) : (
+              <Button
+                type='submit'
+                disabled={isLoading || isLoadingAddresses || !!addressError}
+                className='w-full cursor-pointer disabled:bg-gray-400 sm:w-auto'
+                style={{ backgroundColor: '#E62058' }}
+              >
+                {isLoading ? (
+                  <>
+                    <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                    Running…
+                  </>
+                ) : workflowComplete ? (
+                  'Run again'
+                ) : (
+                  'Run attestation'
+                )}
+              </Button>
+            )}
+          </form>
+
+          <div className='space-y-6 border-t border-gray-200 pt-6'>
+            {(success || currentAttestationStep) && (
+              <div className='space-y-3'>
                 {success && (
-                  <Alert className='bg-green-50 border-green-200 text-green-800'>
+                  <Alert className='border-green-200 bg-green-50 text-green-800'>
                     <CheckCircle className='h-4 w-4' />
                     <AlertDescription>{success}</AlertDescription>
                   </Alert>
                 )}
-
                 {currentAttestationStep && (
-                  <Alert
-                    style={{
-                      backgroundColor: '#fef7f0',
-                      borderColor: '#E62058',
-                      color: '#E62058',
-                    }}
-                  >
-                    <div
-                      className='animate-spin rounded-full h-4 w-4 border-b-2'
-                      style={{ borderColor: '#E62058' }}
-                    ></div>
+                  <Alert className='border border-[#E62058] bg-[#fef7f0] text-[#E62058]'>
+                    <Loader2 className='h-4 w-4 animate-spin' />
                     <AlertDescription>
                       {currentAttestationStep}
                     </AlertDescription>
                   </Alert>
                 )}
-              </form>
-            </TabsContent>
+              </div>
+            )}
 
-            <TabsContent value='workflow' className='space-y-4'>
-              {(error || success || currentAttestationStep) && (
-                <div className='space-y-3'>
-                  {error && (
-                    <Alert variant='destructive'>
-                      <XCircle className='h-4 w-4' />
-                      <AlertDescription>{error}</AlertDescription>
-                    </Alert>
-                  )}
-                  {success && (
-                    <Alert className='bg-green-50 border-green-200 text-green-800'>
-                      <CheckCircle className='h-4 w-4' />
-                      <AlertDescription>{success}</AlertDescription>
-                    </Alert>
-                  )}
-                  {currentAttestationStep && (
-                    <Alert
-                      style={{
-                        backgroundColor: '#fef7f0',
-                        borderColor: '#E62058',
-                        color: '#E62058',
-                      }}
-                    >
-                      <div
-                        className='animate-spin rounded-full h-4 w-4 border-b-2'
-                        style={{ borderColor: '#E62058' }}
-                      ></div>
-                      <AlertDescription>
-                        {currentAttestationStep}
-                      </AlertDescription>
-                    </Alert>
-                  )}
-                </div>
-              )}
-              <p className='text-sm text-gray-600'>
-                Each card mirrors a production integration step. Expand for
-                implementation notes, Flare docs, cURL, and live results.
+            <div className='rounded-xl border border-gray-200 bg-white p-4 sm:p-5'>
+              <WorkflowProgress
+                steps={steps.map(s => ({
+                  id: s.id,
+                  label: s.label,
+                  status: s.status,
+                }))}
+                onSelect={toggleStepExpansion}
+              />
+            </div>
+
+            {!workflowStarted && !isLoading && (
+              <p className='text-center text-sm text-gray-500'>
+                Pick a transaction above and run the attestation to watch the
+                pipeline.
               </p>
-              {steps.map(step => (
-                <Card
-                  key={step.id}
-                  className={`${getStepStatusColor(step.status)}`}
-                >
-                  <CardContent className='p-4'>
-                    <div className='flex items-start gap-3'>
-                      {getStepIcon(step.status)}
-                      <div className='flex-1'>
-                        <div className='flex items-center justify-between'>
-                          <div>
-                            <h3 className='font-semibold text-gray-900'>
-                              {step.title}
-                            </h3>
-                            <p className='text-sm text-gray-600 mb-2'>
+            )}
+
+            {workflowComplete && (
+              <div className='flex items-start gap-3 rounded-xl border border-green-200 bg-green-50 px-4 py-3'>
+                <CheckCircle className='mt-0.5 h-5 w-5 shrink-0 text-green-600' />
+                <div>
+                  <p className='text-sm font-medium text-green-900'>
+                    Attestation verified
+                  </p>
+                  <p className='text-sm text-green-800/80'>
+                    Expand any stage for docs and payloads.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <ol className='space-y-0'>
+                {steps.map((step, index) => {
+                  const isExpanded = isStepExpanded(step);
+                  const isLast = index === steps.length - 1;
+                  const nodeClasses =
+                    step.status === 'completed'
+                      ? 'border-green-500 bg-green-500 text-white'
+                      : step.status === 'error'
+                        ? 'border-red-500 bg-red-500 text-white'
+                        : step.status === 'in_progress'
+                          ? 'border-[#E62058] bg-[#E62058] text-white'
+                          : 'border-gray-300 bg-white text-gray-400';
+
+                  return (
+                    <li key={step.id} className='relative flex gap-3 sm:gap-4'>
+                      <div className='flex w-8 shrink-0 flex-col items-center'>
+                        <span
+                          className={`z-[1] flex h-8 w-8 items-center justify-center rounded-full border-2 text-xs font-semibold ${nodeClasses}`}
+                        >
+                          {step.status === 'completed' ? (
+                            <Check className='h-4 w-4' strokeWidth={2.5} />
+                          ) : step.status === 'error' ? (
+                            <XCircle className='h-4 w-4' />
+                          ) : step.status === 'in_progress' ? (
+                            <Loader2 className='h-4 w-4 animate-spin' />
+                          ) : (
+                            index + 1
+                          )}
+                        </span>
+                        {!isLast && (
+                          <span
+                            className={`mt-1 w-0.5 flex-1 min-h-[1.25rem] ${
+                              step.status === 'completed'
+                                ? 'bg-green-300'
+                                : 'bg-gray-200'
+                            }`}
+                            aria-hidden
+                          />
+                        )}
+                      </div>
+
+                      <div
+                        className={`mb-3 min-w-0 flex-1 rounded-xl border transition-colors ${
+                          step.status === 'in_progress'
+                            ? 'border-[#E62058]/40 bg-[#fef7f0]/60 shadow-sm'
+                            : step.status === 'error'
+                              ? 'border-red-200 bg-red-50/50'
+                              : step.status === 'completed'
+                                ? 'border-gray-200 bg-white'
+                                : 'border-transparent bg-transparent'
+                        }`}
+                      >
+                        <button
+                          type='button'
+                          onClick={() => toggleStepExpansion(step.id)}
+                          className='flex w-full items-start justify-between gap-3 px-3 py-3 text-left sm:px-4'
+                        >
+                          <div className='min-w-0'>
+                            <div className='flex flex-wrap items-center gap-2'>
+                              <h3 className='font-semibold text-gray-900'>
+                                {step.title}
+                              </h3>
+                              {step.status === 'completed' && (
+                                <span className='rounded-full bg-green-100 px-2 py-0.5 text-[11px] font-medium text-green-800'>
+                                  Done
+                                </span>
+                              )}
+                              {step.status === 'in_progress' && (
+                                <span className='rounded-full bg-[#E62058]/10 px-2 py-0.5 text-[11px] font-medium text-[#E62058]'>
+                                  Running
+                                </span>
+                              )}
+                              {step.status === 'error' && (
+                                <span className='rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-medium text-red-700'>
+                                  Failed
+                                </span>
+                              )}
+                            </div>
+                            <p className='mt-0.5 text-sm text-gray-600'>
                               {step.description}
                             </p>
                           </div>
-                          <button
-                            type='button'
-                            onClick={() => toggleStepExpansion(step.id)}
-                            className='flex items-center gap-1 text-sm text-gray-600 hover:text-gray-800'
-                          >
-                            {expandedSteps.has(step.id) ? (
-                              <>
-                                <ChevronDown className='h-4 w-4' />
-                                Hide Details
-                              </>
+                          <span className='mt-0.5 shrink-0 text-gray-400'>
+                            {isExpanded ? (
+                              <ChevronDown className='h-4 w-4' />
                             ) : (
-                              <>
-                                <ChevronRight className='h-4 w-4' />
-                                Show Details
-                              </>
+                              <ChevronRight className='h-4 w-4' />
                             )}
-                          </button>
-                        </div>
+                          </span>
+                        </button>
 
-                        {/* Step Details - Always show for completed steps, expandable for others */}
-                        {(expandedSteps.has(step.id) ||
-                          step.status === 'completed') &&
-                          step.details && (
-                            <div className='mt-4 space-y-4 border-t pt-4'>
-                              <div className='space-y-4'>
-                                <div>
-                                  <h4 className='font-medium text-gray-900 mb-1'>
-                                    Developer summary
-                                  </h4>
-                                  <p className='text-sm text-gray-700'>
-                                    {step.details.whatHappens}
-                                  </p>
-                                </div>
-
-                                <div>
-                                  <h4 className='font-medium text-gray-900 mb-1'>
-                                    Implementation notes
-                                  </h4>
-                                  <p className='text-sm text-gray-700'>
-                                    {step.details.technicalDetails}
-                                  </p>
-                                </div>
-
-                                {step.details.docs &&
-                                  step.details.docs.length > 0 && (
-                                    <StepDocs docs={step.details.docs} />
-                                  )}
-
-                                {step.details.apiEndpoint && (
+                        {isExpanded && (
+                          <div className='space-y-4 border-t border-gray-200/80 px-3 pb-4 pt-3 sm:px-4'>
+                            {step.details && (
+                              <details className='group rounded-lg border border-dashed border-gray-300 bg-white/80'>
+                                <summary className='cursor-pointer list-none px-3 py-2 text-xs font-medium text-gray-700 marker:content-none [&::-webkit-details-marker]:hidden'>
+                                  <span className='inline-flex items-center gap-1'>
+                                    <ChevronRight className='h-3.5 w-3.5 transition-transform group-open:rotate-90' />
+                                    How this stage works
+                                  </span>
+                                </summary>
+                                <div className='space-y-4 border-t border-gray-100 px-3 py-3'>
                                   <div>
-                                    <h4 className='font-medium text-gray-900 mb-1'>
-                                      {step.details.endpointLabel ?? 'Endpoint'}
+                                    <h4 className='mb-1 text-sm font-medium text-gray-900'>
+                                      What happens
                                     </h4>
-                                    {typeof step.details.apiEndpoint ===
-                                    'string' ? (
-                                      <code className='text-sm bg-gray-100 px-2 py-1 rounded font-mono block break-all'>
-                                        {step.details.apiEndpoint}
-                                      </code>
-                                    ) : (
-                                      <div className='text-sm'>
-                                        {step.details.apiEndpoint}
-                                      </div>
+                                    <p className='text-sm text-gray-700'>
+                                      {step.details.whatHappens}
+                                    </p>
+                                  </div>
+                                  <div>
+                                    <h4 className='mb-1 text-sm font-medium text-gray-900'>
+                                      Implementation notes
+                                    </h4>
+                                    <p className='text-sm text-gray-700'>
+                                      {step.details.technicalDetails}
+                                    </p>
+                                  </div>
+                                  {step.details.docs &&
+                                    step.details.docs.length > 0 && (
+                                      <StepDocs docs={step.details.docs} />
                                     )}
-                                  </div>
-                                )}
-
-                                {step.details.curlCommand && (
-                                  <div>
-                                    <h4 className='font-medium text-gray-900 mb-1'>
-                                      cURL example
-                                    </h4>
-                                    <div className='bg-gray-900 text-gray-100 p-3 rounded text-xs font-mono overflow-x-auto'>
-                                      <pre className='whitespace-pre-wrap'>
-                                        {step.details.curlCommand}
-                                      </pre>
-                                    </div>
-                                    <button
-                                      type='button'
-                                      onClick={() =>
-                                        copyToClipboardWithTimeout(
-                                          step.details!.curlCommand!,
-                                          setCopiedText
-                                        )
-                                      }
-                                      className='mt-2 text-xs hover:opacity-80 flex items-center gap-1'
-                                      style={{ color: '#E62058' }}
-                                    >
-                                      {copiedText ===
-                                      step.details!.curlCommand ? (
-                                        <>
-                                          <Check className='h-3 w-3' />
-                                          Copied!
-                                        </>
+                                  {step.details.apiEndpoint && (
+                                    <div>
+                                      <h4 className='mb-1 text-sm font-medium text-gray-900'>
+                                        {step.details.endpointLabel ??
+                                          'Endpoint'}
+                                      </h4>
+                                      {typeof step.details.apiEndpoint ===
+                                      'string' ? (
+                                        <code className='block break-all rounded bg-gray-100 px-2 py-1 font-mono text-xs'>
+                                          {step.details.apiEndpoint}
+                                        </code>
                                       ) : (
-                                        <>
-                                          <Copy className='h-3 w-3' />
-                                          Copy cURL
-                                        </>
+                                        <div className='text-sm'>
+                                          {step.details.apiEndpoint}
+                                        </div>
                                       )}
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          )}
+                                    </div>
+                                  )}
+                                  {step.details.curlCommand && (
+                                    <div>
+                                      <h4 className='mb-1 text-sm font-medium text-gray-900'>
+                                        cURL example
+                                      </h4>
+                                      <div className='overflow-x-auto rounded bg-gray-900 p-3 font-mono text-xs text-gray-100'>
+                                        <pre className='whitespace-pre-wrap'>
+                                          {step.details.curlCommand}
+                                        </pre>
+                                      </div>
+                                      <button
+                                        type='button'
+                                        onClick={() =>
+                                          copyToClipboardWithTimeout(
+                                            step.details!.curlCommand!,
+                                            setCopiedText
+                                          )
+                                        }
+                                        className='mt-2 flex items-center gap-1 text-xs text-[#E62058] hover:opacity-80'
+                                      >
+                                        {copiedText ===
+                                        step.details!.curlCommand ? (
+                                          <>
+                                            <Check className='h-3 w-3' />
+                                            Copied
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Copy className='h-3 w-3' />
+                                            Copy cURL
+                                          </>
+                                        )}
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              </details>
+                            )}
 
-                        {/* Step Data - Show actual results */}
-                        {step.data && (
-                          <div className='mt-4 space-y-2 border-t pt-4'>
-                            <h4 className='font-medium text-gray-900'>
-                              Results:
-                            </h4>
+                            {step.data && (
+                              <div className='space-y-2'>
+                                <h4 className='text-sm font-medium text-gray-900'>
+                                  Live result
+                                </h4>
 
                             {step.data?.abiEncodedRequest && (
                               <div className='flex items-center gap-2'>
@@ -2104,427 +1805,15 @@ export default function Fdc() {
                               </div>
                             )}
 
-                            {step.data.evmAttestation &&
-                              (() => {
-                                const evm = step.data.evmAttestation as {
-                                  requiredConfirmations: string | number;
-                                  blockNumber: string;
-                                  timestamp: string;
-                                  sourceAddress: string;
-                                  receivingAddress: string;
-                                  value: string;
-                                  input: string;
-                                  status: number;
-                                  isDeployment: boolean;
-                                  events: EVMTransactionEvent[];
-                                };
-                                const events = evm.events ?? [];
-
-                                return (
-                                  <div className='space-y-3 border-t border-gray-200 pt-3'>
-                                    <h5 className='font-medium text-gray-900'>
-                                      Attested EVM Transaction
-                                    </h5>
-                                    <div className='grid gap-2 text-sm'>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>
-                                          Required confirmations:
-                                        </span>
-                                        <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono'>
-                                          {String(evm.requiredConfirmations)}
-                                        </code>
-                                      </div>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>
-                                          Sepolia block:
-                                        </span>
-                                        <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono'>
-                                          {String(evm.blockNumber)}
-                                        </code>
-                                        <a
-                                          href={`https://sepolia.etherscan.io/block/${String(evm.blockNumber)}`}
-                                          target='_blank'
-                                          rel='noopener noreferrer'
-                                          className='hover:opacity-80 text-xs underline inline-flex items-center gap-1'
-                                          style={{ color: '#E62058' }}
-                                        >
-                                          View
-                                          <ExternalLink className='h-3 w-3' />
-                                        </a>
-                                      </div>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>
-                                          Timestamp:
-                                        </span>
-                                        <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono'>
-                                          {String(evm.timestamp)}
-                                        </code>
-                                        {Number(evm.timestamp) > 0 && (
-                                          <span className='text-xs text-gray-600'>
-                                            (
-                                            {new Date(
-                                              Number(evm.timestamp) * 1000
-                                            ).toLocaleString()}
-                                            )
-                                          </span>
-                                        )}
-                                      </div>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>
-                                          From:
-                                        </span>
-                                        <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono break-all'>
-                                          {truncateHex(
-                                            String(evm.sourceAddress)
-                                          )}
-                                        </code>
-                                        <a
-                                          href={`https://sepolia.etherscan.io/address/${String(evm.sourceAddress)}`}
-                                          target='_blank'
-                                          rel='noopener noreferrer'
-                                          className='hover:opacity-80 text-xs underline inline-flex items-center gap-1'
-                                          style={{ color: '#E62058' }}
-                                        >
-                                          <ExternalLink className='h-3 w-3' />
-                                        </a>
-                                      </div>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>To:</span>
-                                        <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono break-all'>
-                                          {truncateHex(
-                                            String(evm.receivingAddress)
-                                          )}
-                                        </code>
-                                        <a
-                                          href={`https://sepolia.etherscan.io/address/${String(evm.receivingAddress)}`}
-                                          target='_blank'
-                                          rel='noopener noreferrer'
-                                          className='hover:opacity-80 text-xs underline inline-flex items-center gap-1'
-                                          style={{ color: '#E62058' }}
-                                        >
-                                          <ExternalLink className='h-3 w-3' />
-                                        </a>
-                                        {evm.isDeployment && (
-                                          <span className='text-xs text-gray-600'>
-                                            (deployment)
-                                          </span>
-                                        )}
-                                      </div>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>
-                                          Value:
-                                        </span>
-                                        <code className='px-2 py-1 bg-gray-100 rounded text-xs font-mono'>
-                                          {String(evm.value)} wei
-                                        </code>
-                                      </div>
-                                      <div className='flex items-start gap-2'>
-                                        <span className='font-medium shrink-0'>
-                                          Input:
-                                        </span>
-                                        <code className='break-all bg-gray-100 px-2 py-1 rounded text-xs font-mono flex-1 max-h-32 overflow-y-auto'>
-                                          {String(evm.input || '0x')}
-                                        </code>
-                                        <button
-                                          type='button'
-                                          onClick={() =>
-                                            copyToClipboardWithTimeout(
-                                              String(evm.input || '0x'),
-                                              setCopiedText
-                                            )
-                                          }
-                                          className='h-6 w-6 p-0 hover:bg-gray-200 rounded shrink-0'
-                                        >
-                                          {copiedText ===
-                                          String(evm.input || '0x') ? (
-                                            <Check className='h-3 w-3 text-green-600' />
-                                          ) : (
-                                            <Copy className='h-3 w-3 text-gray-500' />
-                                          )}
-                                        </button>
-                                      </div>
-                                      <div className='flex flex-wrap items-center gap-2'>
-                                        <span className='font-medium'>
-                                          Status:
-                                        </span>
-                                        <code
-                                          className={`px-2 py-1 rounded text-xs font-mono ${
-                                            Number(evm.status) === 1
-                                              ? 'bg-green-100 text-green-800'
-                                              : 'bg-red-100 text-red-800'
-                                          }`}
-                                        >
-                                          {Number(evm.status) === 1
-                                            ? 'Success'
-                                            : 'Failed'}
-                                        </code>
-                                      </div>
-                                    </div>
-
-                                    <div className='space-y-2'>
-                                      <h6 className='font-medium text-gray-900'>
-                                        Event logs ({events.length})
-                                      </h6>
-                                      {events.length === 0 ? (
-                                        <p className='text-xs text-gray-600'>
-                                          No events returned (listEvents may be
-                                          false or the transaction emitted
-                                          none).
-                                        </p>
-                                      ) : (
-                                        <div className='space-y-2 max-h-96 overflow-y-auto'>
-                                          {events.map((event, index) => {
-                                            const decoded =
-                                              decodeEvmTransactionEvent(event);
-
-                                            return (
-                                              <details
-                                                key={`${event.logIndex}-${index}`}
-                                                className='rounded border border-gray-200 bg-white'
-                                                open={Boolean(decoded)}
-                                              >
-                                                <summary className='cursor-pointer px-3 py-2 text-xs font-medium flex flex-wrap items-center gap-2'>
-                                                  <span>
-                                                    logIndex{' '}
-                                                    {String(event.logIndex)}
-                                                  </span>
-                                                  {decoded ? (
-                                                    <span
-                                                      className='rounded px-1.5 py-0.5 font-semibold'
-                                                      style={{
-                                                        backgroundColor:
-                                                          '#fef7f0',
-                                                        color: '#E62058',
-                                                      }}
-                                                    >
-                                                      {decoded.eventName}
-                                                    </span>
-                                                  ) : (
-                                                    <span className='text-gray-500'>
-                                                      Unknown event
-                                                    </span>
-                                                  )}
-                                                  <code className='font-mono text-gray-600'>
-                                                    {truncateHex(
-                                                      String(
-                                                        event.emitterAddress
-                                                      ),
-                                                      8,
-                                                      6
-                                                    )}
-                                                  </code>
-                                                  {event.removed && (
-                                                    <span className='text-red-600'>
-                                                      removed
-                                                    </span>
-                                                  )}
-                                                </summary>
-                                                <div className='border-t border-gray-100 px-3 py-2 space-y-2 text-xs'>
-                                                  {decoded && (
-                                                    <div className='space-y-2 rounded border border-gray-100 bg-gray-50 p-2'>
-                                                      <div className='font-semibold text-gray-900'>
-                                                        Decoded{' '}
-                                                        {decoded.eventName}
-                                                      </div>
-                                                      <ul className='space-y-1.5'>
-                                                        {decoded.args.map(
-                                                          arg => (
-                                                            <li
-                                                              key={`${index}-${arg.name}`}
-                                                              className='flex flex-col gap-0.5 sm:flex-row sm:items-start sm:gap-2'
-                                                            >
-                                                              <span className='shrink-0 font-medium text-gray-700 sm:w-40'>
-                                                                {arg.name}
-                                                                <span className='ml-1 font-normal text-gray-500'>
-                                                                  ({arg.type}
-                                                                  {arg.indexed
-                                                                    ? ', indexed'
-                                                                    : ''}
-                                                                  )
-                                                                </span>
-                                                              </span>
-                                                              <div className='flex min-w-0 flex-1 items-start gap-1'>
-                                                                <code className='break-all rounded bg-white px-1 py-0.5 font-mono'>
-                                                                  {arg
-                                                                    .displayValue
-                                                                    .length > 96
-                                                                    ? truncateHex(
-                                                                        arg.displayValue,
-                                                                        24,
-                                                                        20
-                                                                      )
-                                                                    : arg.displayValue}
-                                                                </code>
-                                                                <button
-                                                                  type='button'
-                                                                  onClick={() =>
-                                                                    copyToClipboardWithTimeout(
-                                                                      arg.value,
-                                                                      setCopiedText
-                                                                    )
-                                                                  }
-                                                                  className='h-6 w-6 shrink-0 rounded p-0 hover:bg-gray-200'
-                                                                >
-                                                                  {copiedText ===
-                                                                  arg.value ? (
-                                                                    <Check className='h-3 w-3 text-green-600' />
-                                                                  ) : (
-                                                                    <Copy className='h-3 w-3 text-gray-500' />
-                                                                  )}
-                                                                </button>
-                                                              </div>
-                                                            </li>
-                                                          )
-                                                        )}
-                                                      </ul>
-                                                    </div>
-                                                  )}
-
-                                                  <div className='flex flex-wrap items-center gap-2'>
-                                                    <span className='font-semibold'>
-                                                      Emitter:
-                                                    </span>
-                                                    <code className='break-all rounded bg-gray-50 px-1'>
-                                                      {String(
-                                                        event.emitterAddress
-                                                      )}
-                                                    </code>
-                                                    <a
-                                                      href={`https://sepolia.etherscan.io/address/${String(event.emitterAddress)}`}
-                                                      target='_blank'
-                                                      rel='noopener noreferrer'
-                                                      className='inline-flex items-center gap-1 underline'
-                                                      style={{
-                                                        color: '#E62058',
-                                                      }}
-                                                    >
-                                                      <ExternalLink className='h-3 w-3' />
-                                                    </a>
-                                                    <button
-                                                      type='button'
-                                                      onClick={() =>
-                                                        copyToClipboardWithTimeout(
-                                                          String(
-                                                            event.emitterAddress
-                                                          ),
-                                                          setCopiedText
-                                                        )
-                                                      }
-                                                      className='h-6 w-6 rounded p-0 hover:bg-gray-200'
-                                                    >
-                                                      {copiedText ===
-                                                      String(
-                                                        event.emitterAddress
-                                                      ) ? (
-                                                        <Check className='h-3 w-3 text-green-600' />
-                                                      ) : (
-                                                        <Copy className='h-3 w-3 text-gray-500' />
-                                                      )}
-                                                    </button>
-                                                  </div>
-
-                                                  <details className='rounded border border-dashed border-gray-200'>
-                                                    <summary className='cursor-pointer px-2 py-1 text-gray-600'>
-                                                      Raw topics &amp; data
-                                                    </summary>
-                                                    <div className='space-y-2 border-t border-gray-100 px-2 py-2'>
-                                                      <div>
-                                                        <span className='font-semibold'>
-                                                          Topics (
-                                                          {event.topics.length}
-                                                          ):
-                                                        </span>
-                                                        <ul className='mt-1 space-y-1'>
-                                                          {event.topics.map(
-                                                            (
-                                                              topic,
-                                                              topicIndex
-                                                            ) => (
-                                                              <li
-                                                                key={`${index}-topic-${topicIndex}`}
-                                                                className='flex items-start gap-2'
-                                                              >
-                                                                <span className='shrink-0 text-gray-500'>
-                                                                  [{topicIndex}]
-                                                                </span>
-                                                                <code className='flex-1 break-all rounded bg-gray-50 px-1'>
-                                                                  {truncateHex(
-                                                                    String(
-                                                                      topic
-                                                                    ),
-                                                                    18,
-                                                                    12
-                                                                  )}
-                                                                </code>
-                                                                <button
-                                                                  type='button'
-                                                                  onClick={() =>
-                                                                    copyToClipboardWithTimeout(
-                                                                      String(
-                                                                        topic
-                                                                      ),
-                                                                      setCopiedText
-                                                                    )
-                                                                  }
-                                                                  className='h-6 w-6 shrink-0 rounded p-0 hover:bg-gray-200'
-                                                                >
-                                                                  {copiedText ===
-                                                                  String(
-                                                                    topic
-                                                                  ) ? (
-                                                                    <Check className='h-3 w-3 text-green-600' />
-                                                                  ) : (
-                                                                    <Copy className='h-3 w-3 text-gray-500' />
-                                                                  )}
-                                                                </button>
-                                                              </li>
-                                                            )
-                                                          )}
-                                                        </ul>
-                                                      </div>
-                                                      <div className='flex items-start gap-2'>
-                                                        <span className='shrink-0 font-semibold'>
-                                                          Data:
-                                                        </span>
-                                                        <code className='flex-1 break-all rounded bg-gray-50 px-1'>
-                                                          {truncateHex(
-                                                            String(event.data),
-                                                            20,
-                                                            16
-                                                          )}
-                                                        </code>
-                                                        <button
-                                                          type='button'
-                                                          onClick={() =>
-                                                            copyToClipboardWithTimeout(
-                                                              String(
-                                                                event.data
-                                                              ),
-                                                              setCopiedText
-                                                            )
-                                                          }
-                                                          className='h-6 w-6 shrink-0 rounded p-0 hover:bg-gray-200'
-                                                        >
-                                                          {copiedText ===
-                                                          String(event.data) ? (
-                                                            <Check className='h-3 w-3 text-green-600' />
-                                                          ) : (
-                                                            <Copy className='h-3 w-3 text-gray-500' />
-                                                          )}
-                                                        </button>
-                                                      </div>
-                                                    </div>
-                                                  </details>
-                                                </div>
-                                              </details>
-                                            );
-                                          })}
-                                        </div>
-                                      )}
-                                    </div>
-                                  </div>
-                                );
-                              })()}
+                            {step.data.evmAttestation && (
+                              <EvmAttestationSummary
+                                evm={
+                                  step.data.evmAttestation as EvmAttestationView
+                                }
+                                copiedText={copiedText}
+                                setCopiedText={setCopiedText}
+                              />
+                            )}
 
                             {/* Show request/response details for the first step */}
                             {step.data.requestDetails && (
@@ -2814,196 +2103,19 @@ export default function Fdc() {
                           </div>
                         )}
 
-                        {step.error && (
-                          <div className='mt-3 p-2 bg-red-100 border border-red-200 rounded text-sm text-red-700'>
-                            Error: {step.error}
+                            {step.error && (
+                              <div className='rounded-lg border border-red-200 bg-red-100 p-2 text-sm text-red-700'>
+                                {step.error}
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </TabsContent>
-
-            <TabsContent value='guide' className='space-y-6'>
-              <div
-                className='rounded-lg p-4'
-                style={{
-                  backgroundColor: '#fef7f0',
-                  borderColor: '#E62058',
-                  borderWidth: '1px',
-                  borderStyle: 'solid',
-                }}
-              >
-                <h4 className='font-medium mb-2' style={{ color: '#E62058' }}>
-                  How to run this demo
-                </h4>
-                <ul className='text-sm space-y-1.5' style={{ color: '#E62058' }}>
-                  <li>
-                    1. Connect a wallet on Coston2 and fund it for the
-                    attestation fee
-                  </li>
-                  <li>
-                    2. Pick EVMTransaction (Sepolia / testETH) or XRPPayment
-                    (testXRP)
-                  </li>
-                  <li>
-                    3. Use the sample tx or paste your own; for EVM set
-                    confirmations, input/events flags, and optional log indices
-                  </li>
-                  <li>
-                    4. Run Execute FDC Workflow, then open Workflow to inspect
-                    each step (docs, cURL, live results)
-                  </li>
-                </ul>
-              </div>
-
-              <div
-                className='rounded-lg border p-4'
-                style={{ backgroundColor: '#fef7f0', borderColor: '#E62058' }}
-              >
-                <h3 className='font-semibold mb-3' style={{ color: '#E62058' }}>
-                  Pipeline map (what you implement)
-                </h3>
-                <div className='space-y-3 text-sm' style={{ color: '#E62058' }}>
-                  <p>
-                    Same five stages as production FDC integrations. Expand each
-                    Workflow card for docs, notes, and copyable payloads.
-                  </p>
-                  <ol className='list-decimal list-inside space-y-2 ml-0.5'>
-                    <li>
-                      <strong>Prepare</strong> — verifier{' '}
-                      <code className='text-xs'>prepareRequest</code> →{' '}
-                      <code className='text-xs'>abiEncodedRequest</code>
                     </li>
-                    <li>
-                      <strong>Submit</strong> —{' '}
-                      <DocLink href='https://dev.flare.network/fdc/reference/IFdcHub#requestattestation'>
-                        FdcHub.requestAttestation
-                      </DocLink>{' '}
-                      + fee; derive <code className='text-xs'>roundId</code>
-                    </li>
-                    <li>
-                      <strong>Finalize</strong> — poll{' '}
-                      <DocLink href='https://dev.flare.network/network/fsp/solidity-reference/IRelay#isfinalized'>
-                        Relay.isFinalized(200, roundId)
-                      </DocLink>
-                    </li>
-                    <li>
-                      <strong>Fetch proof</strong> — DA Layer{' '}
-                      <DocLink href='https://dev.flare.network/fdc/reference/data-availability-api'>
-                        proof-by-request-round
-                      </DocLink>
-                    </li>
-                    <li>
-                      <strong>Verify</strong> —{' '}
-                      {attestationType === 'EVMTransaction' ? (
-                        <DocLink href='https://dev.flare.network/fdc/reference/IFdcVerification#verifyevmtransaction'>
-                          verifyEVMTransaction
-                        </DocLink>
-                      ) : (
-                        <DocLink href='https://dev.flare.network/fdc/reference/IFdcVerification#verifyxrppayment'>
-                          verifyXRPPayment
-                        </DocLink>
-                      )}{' '}
-                      then consume attested fields
-                    </li>
-                  </ol>
-                </div>
-              </div>
-
-              <div
-                className='rounded-lg border border-gray-200 bg-white p-4'
-              >
-                <h3 className='font-semibold text-gray-900 mb-3'>
-                  Flare documentation
-                </h3>
-                <ul className='space-y-2 text-sm'>
-                  <li>
-                    <DocLink href='https://dev.flare.network/fdc/overview'>
-                      FDC overview
-                    </DocLink>
-                    <span className='text-gray-600'>
-                      {' '}
-                      — architecture, types, DA Layer
-                    </span>
-                  </li>
-                  <li>
-                    <DocLink href='https://dev.flare.network/fdc/getting-started'>
-                      Getting started
-                    </DocLink>
-                    <span className='text-gray-600'>
-                      {' '}
-                      — prepare → submit → proof → verify
-                    </span>
-                  </li>
-                  <li>
-                    <DocLink href='https://dev.flare.network/fdc/guides/fdc-by-hand/'>
-                      FDC by hand
-                    </DocLink>
-                    <span className='text-gray-600'>
-                      {' '}
-                      — manual walkthrough matching this UI
-                    </span>
-                  </li>
-                  <li>
-                    {attestationType === 'EVMTransaction' ? (
-                      <DocLink href='https://dev.flare.network/fdc/attestation-types/evm-transaction'>
-                        EVMTransaction spec
-                      </DocLink>
-                    ) : (
-                      <DocLink href='https://dev.flare.network/fdc/attestation-types/xrp-payment'>
-                        XRPPayment spec
-                      </DocLink>
-                    )}
-                    <span className='text-gray-600'>
-                      {' '}
-                      — request/response fields
-                    </span>
-                  </li>
-                  <li>
-                    {attestationType === 'EVMTransaction' ? (
-                      <DocLink href='https://dev.flare.network/fdc/guides/hardhat/evm-transaction'>
-                        Hardhat: EVMTransaction
-                      </DocLink>
-                    ) : (
-                      <DocLink href='https://dev.flare.network/fdc/guides/hardhat/payment'>
-                        Hardhat: Payment
-                      </DocLink>
-                    )}
-                    <span className='text-gray-600'>
-                      {' '}
-                      — script + contract patterns
-                    </span>
-                  </li>
-                  <li>
-                    <DocLink href='https://dev.flare.network/fdc/reference/IFdcHub'>
-                      IFdcHub
-                    </DocLink>
-                    {' · '}
-                    <DocLink href='https://dev.flare.network/fdc/reference/IFdcVerification'>
-                      IFdcVerification
-                    </DocLink>
-                    {' · '}
-                    <DocLink href='https://dev.flare.network/fdc/reference/data-availability-api'>
-                      DA API
-                    </DocLink>
-                  </li>
-                  <li>
-                    <DocLink href='https://github.com/flare-foundation/flare-hardhat-starter'>
-                      flare-hardhat-starter
-                    </DocLink>
-                    <span className='text-gray-600'>
-                      {' '}
-                      — canonical scripts under{' '}
-                      <code className='text-xs'>scripts/fdcExample/</code>
-                    </span>
-                  </li>
-                </ul>
-              </div>
-            </TabsContent>
-          </Tabs>
+                  );
+                })}
+              </ol>
+          </div>
         </CardContent>
       </Card>
     </div>
