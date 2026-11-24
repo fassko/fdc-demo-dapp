@@ -207,12 +207,26 @@ export const nativeEthTokenMeta = (address: Address): Erc20TokenMeta => ({
 
 const tokenMetaCache = new Map<string, Promise<Erc20TokenMeta | null>>();
 
+/**
+ * viem's ReadContractParameters marks `authorizationList` as required when the
+ * call is inferred from erc20Abi, which fails `next build` typecheck. The other
+ * contract reads in this app cast the client for the same reason.
+ */
+const readSepoliaContract = async <T>(params: {
+  address: Address;
+  abi: typeof erc20Abi;
+  functionName: 'decimals' | 'symbol';
+}): Promise<T> => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (sepoliaClient as any).readContract(params) as Promise<T>;
+};
+
 const readErc20TokenMeta = async (
   address: Address
 ): Promise<Erc20TokenMeta | null> => {
   let decimals: number;
   try {
-    decimals = await sepoliaClient.readContract({
+    decimals = await readSepoliaContract<number>({
       address,
       abi: erc20Abi,
       functionName: 'decimals',
@@ -227,7 +241,7 @@ const readErc20TokenMeta = async (
 
   let symbol = 'TOKEN';
   try {
-    const raw = await sepoliaClient.readContract({
+    const raw = await readSepoliaContract<string>({
       address,
       abi: erc20Abi,
       functionName: 'symbol',
