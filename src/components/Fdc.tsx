@@ -1,7 +1,7 @@
 'use client';
 
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -63,8 +63,9 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 /** LayerZero message on Sepolia — used as the EVMTransaction demo default */
 const SEPOLIA_TX_HASH =
   '0x8cc5c3614eb9fd0f82d44f841a520962d93ee053f012fa1639c91d40c1123f16';
+/** FTestXRP Core Vault mint on XRPL testnet: 10.4 XRP, 32-byte direct-mint memo. */
 const SAMPLE_XRPL_TX =
-  'A6589F33CA3B679CF3E833632E81E5A075CED6057316782A2B466FF64D05CBF0';
+  'B8DCE419A528A4541CDE0BDDFC0EC8F72E0B3F7779E38B3CD130EFE3CC0463D6';
 
 /** Fixed demo request params — keeps the configure UI to a single tx hash field. */
 const EVM_DEMO_REQUEST = {
@@ -438,6 +439,10 @@ export default function Fdc() {
   > | null>(null);
   const [currentAttestationStep, setCurrentAttestationStep] =
     useState<string>('');
+  // One continuation per submitted tx. Switching attestation type recreates
+  // continueWorkflowAfterSubmission, and wagmi keeps the previous receipt.
+  const continuedHashRef = useRef<string | null>(null);
+  const workflowGenerationRef = useRef(0);
   const [proofData, setProofData] = useState<Record<string, unknown> | null>(
     null
   );
@@ -528,8 +533,12 @@ export default function Fdc() {
   );
 
   const continueWorkflowAfterSubmission = useCallback(
-    async (transactionReceipt: any) => {
+    async (transactionReceipt: any, generation: number) => {
+      const stillCurrent = () => workflowGenerationRef.current === generation;
+
       try {
+        if (!stillCurrent()) return;
+
         // Step 3: Wait for Finalization (calculate round ID)
         updateStepStatus('wait-finalization', 'in_progress');
         setCurrentAttestationStep('Calculating round ID from transaction...');
@@ -543,6 +552,7 @@ export default function Fdc() {
           { receipt: { blockNumber: transactionReceipt.blockNumber } },
           fdcAddresses
         );
+        if (!stillCurrent()) return;
 
         console.log('Calculated round ID:', roundId);
 
@@ -563,10 +573,13 @@ export default function Fdc() {
         const maxAttempts = 20; // Poll for up to 2 minutes (20 * 6 seconds)
 
         while (!isFinalized && attempts < maxAttempts) {
+          if (!stillCurrent()) return;
+
           try {
             // In a real implementation, this would check the Flare Systems Manager contract
             // For now, we'll simulate the finalization check with a realistic delay
             await new Promise(resolve => setTimeout(resolve, 6000)); // Wait 6 seconds between checks
+            if (!stillCurrent()) return;
 
             attempts++;
 
@@ -583,9 +596,12 @@ export default function Fdc() {
           } catch (error) {
             console.error('Error checking finalization:', error);
             await new Promise(resolve => setTimeout(resolve, 6000));
+            if (!stillCurrent()) return;
             attempts++;
           }
         }
+
+        if (!stillCurrent()) return;
 
         if (!isFinalized) {
           throw new Error(
@@ -619,6 +635,7 @@ export default function Fdc() {
                 roundId,
                 FDC_CONSTANTS.DA_LAYER_API_KEY
               );
+        if (!stillCurrent()) return;
 
         setProofData(proof);
 
@@ -705,6 +722,7 @@ export default function Fdc() {
             proof as EVMTransactionProofData,
             fdcAddresses
           );
+          if (!stillCurrent()) return;
 
           console.log('=== EVMTransaction verification result ===');
           console.log('Verification result:', verificationResult);
@@ -745,6 +763,7 @@ export default function Fdc() {
             proof as XRPPaymentProofData,
             fdcAddresses
           );
+          if (!stillCurrent()) return;
 
           console.log('=== XRPPayment verification result ===');
           console.log('Verification result:', verificationResult);
@@ -765,13 +784,14 @@ export default function Fdc() {
           'FDC workflow completed successfully! All steps have been executed.'
         );
       } catch (error) {
+        if (!stillCurrent()) return;
         console.error('Error in workflow continuation:', error);
         setCurrentAttestationStep('');
         setError(
           error instanceof Error ? error.message : 'Unknown error occurred'
         );
       } finally {
-        setIsLoading(false);
+        if (stillCurrent()) setIsLoading(false);
       }
     },
     [
@@ -785,29 +805,41 @@ export default function Fdc() {
     ]
   );
 
-  // Handle transaction success
+  // Handle transaction success. Wagmi keeps the last receipt, and this
+  // callback is recreated when the attestation type changes — continue once
+  // per transaction so a type switch does not replay finalization.
   useEffect(() => {
-    if (isAttestationSuccess && receipt && currentAttestationData) {
-      updateStepStatus('submit-request', 'completed', {
-        message:
-          'Attestation request submitted successfully to FdcHub contract',
-        transactionHash: attestationHash,
-        blockNumber: receipt.blockNumber,
-        abiEncodedRequest: currentAttestationData.abiEncodedRequest,
-      });
-
-      // Auto-expand the second step when it completes
-      setExpandedSteps(prev => new Set([...prev, 'submit-request']));
-
-      // Continue with the rest of the workflow
-      continueWorkflowAfterSubmission(receipt);
+    if (
+      !isAttestationSuccess ||
+      !receipt ||
+      !currentAttestationData ||
+      !attestationHash ||
+      continuedHashRef.current === attestationHash
+    ) {
+      return;
     }
+
+    continuedHashRef.current = attestationHash;
+
+    updateStepStatus('submit-request', 'completed', {
+      message: 'Attestation request submitted successfully to FdcHub contract',
+      transactionHash: attestationHash,
+      blockNumber: receipt.blockNumber,
+      abiEncodedRequest: currentAttestationData.abiEncodedRequest,
+    });
+
+    // Auto-expand the second step when it completes
+    setExpandedSteps(prev => new Set([...prev, 'submit-request']));
+
+    const generation = workflowGenerationRef.current;
+    void continueWorkflowAfterSubmission(receipt, generation);
   }, [
     isAttestationSuccess,
     receipt,
     currentAttestationData,
     attestationHash,
     continueWorkflowAfterSubmission,
+    updateStepStatus,
   ]);
 
   // Handle write contract errors
@@ -828,6 +860,9 @@ export default function Fdc() {
   );
 
   useEffect(() => {
+    workflowGenerationRef.current += 1;
+    setCurrentAttestationStep('');
+    setIsLoading(false);
     reset({
       transactionId:
         attestationType === 'EVMTransaction' ? SEPOLIA_TX_HASH : SAMPLE_XRPL_TX,
@@ -1203,7 +1238,7 @@ export default function Fdc() {
                     href={
                       attestationType === 'EVMTransaction'
                         ? `https://sepolia.etherscan.io/tx/${SEPOLIA_TX_HASH}`
-                        : `https://livenet.xrpl.org/transactions/${SAMPLE_XRPL_TX}`
+                        : `https://testnet.xrpl.org/transactions/${SAMPLE_XRPL_TX}`
                     }
                     target='_blank'
                     rel='noopener noreferrer'
@@ -1236,7 +1271,7 @@ export default function Fdc() {
                 <p className='text-xs text-gray-500'>
                   {attestationType === 'EVMTransaction'
                     ? 'Sepolia sample is a LayerZero OFT send.'
-                    : 'XRPL testnet payment.'}
+                    : 'XRPL testnet payment to the FTestXRP Core Vault (10.4 XRP).'}
                 </p>
               )}
             </div>
